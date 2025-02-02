@@ -331,76 +331,39 @@ func (sc searchContext) _pathsToNode(fn *filenode.FileNode, observedPaths file.P
 	}
 
 	paths := file.NewPathSet()
+
+	if observedPaths != nil && observedPaths.Contains(fn.RealPath) {
+		return paths, nil
+	}
+
 	paths.Add(fn.RealPath)
 
 	if observedPaths != nil {
-		if observedPaths.Contains(fn.RealPath) {
-			// we've already observed this path, so we can stop here
-			return nil, nil
-		}
 		observedPaths.Add(fn.RealPath)
+		defer observedPaths.Remove(fn.RealPath)
 	}
 
 	nodeID := fn.ID()
-
-	addPath := func(suffix string, ps ...file.Path) {
-		for _, p := range ps {
-			if suffix != "" {
-				p = file.Path(path.Join(string(p), suffix))
+	if refs, ok := sc.linkBackwardRefs[nodeID]; ok {
+		for _, linkSrcID := range refs.List() {
+			if pfn := sc.tree.tree.Node(linkSrcID); pfn != nil {
+				paths.Add(pfn.(*filenode.FileNode).RealPath)
 			}
-			paths.Add(p)
 		}
 	}
 
-	// add all paths to the node that are linked to it
-	for _, linkSrcID := range sc.linkBackwardRefs[nodeID].List() {
-		pfn := sc.tree.tree.Node(linkSrcID)
-		if pfn == nil {
-			log.WithFields("id", nodeID, "parent", linkSrcID).Warn("found non-existent parent link")
-			continue
-		}
-		linkSrcPaths, err := sc.pathsToNode(pfn.(*filenode.FileNode), observedPaths, cache)
+	if parent := path.Dir(string(fn.RealPath)); parent != "." && parent != "/" {
+		pna, err := sc.tree.node(file.Path(parent), linkResolutionStrategy{
+			FollowAncestorLinks: false,
+			FollowBasenameLinks: false,
+		})
 		if err != nil {
 			return nil, err
 		}
-
-		addPath("", linkSrcPaths.List()...)
-	}
-
-	// crawl up the tree to find all paths to our parent and repeat
-	for _, p := range paths.List() {
-		nextNestedSuffix := p.Basename()
-		allParentPaths := p.ConstituentPaths()
-		sort.Sort(sort.Reverse(file.Paths(allParentPaths)))
-
-		for _, pp := range allParentPaths {
-			if pp == "/" {
-				break
-			}
-
-			nestedSuffix := nextNestedSuffix
-			nextNestedSuffix = path.Join(pp.Basename(), nestedSuffix)
-
-			pna, err := sc.tree.node(pp, linkResolutionStrategy{
-				FollowAncestorLinks: true,
-				FollowBasenameLinks: false,
-			})
-			if err != nil {
-				return nil, fmt.Errorf("unable to get parent node for path=%q: %w", pp, err)
-			}
-
-			if !pna.HasFileNode() {
-				continue
-			}
-
-			parentLinkPaths, err := sc.pathsToNode(pna.FileNode, observedPaths, cache)
-			if err != nil {
-				return nil, err
-			}
-			addPath(nestedSuffix, parentLinkPaths.List()...)
+		if pna.HasFileNode() {
+			paths.Add(pna.FileNode.RealPath)
 		}
 	}
-	observedPaths.Remove(fn.RealPath)
 
 	return paths, nil
 }
