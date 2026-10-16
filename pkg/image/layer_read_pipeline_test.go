@@ -528,6 +528,18 @@ func TestImage_Read_imageSquashOnlyKeepsOnlyTheTopSquash(t *testing.T) {
 	assert.ErrorContains(t, err, "no squashed tree")
 	_, err = img.Layers[0].OpenPathFromSquash("/shared.txt")
 	assert.Error(t, err)
+
+	for _, layer := range img.Layers[:top] {
+		refs, err := layer.FilesByMIMETypeFromSquash("text/plain")
+		assert.Nil(t, refs)
+		assert.ErrorContains(t, err, "no squashed search context")
+	}
+	wantRefs, err := full.Layers[top].FilesByMIMETypeFromSquash("text/plain")
+	require.NoError(t, err)
+	require.NotEmpty(t, wantRefs)
+	gotRefs, err := img.Layers[top].FilesByMIMETypeFromSquash("text/plain")
+	require.NoError(t, err)
+	assert.Len(t, gotRefs, len(wantRefs))
 }
 
 func TestImage_Read_fetchFailureDoesNotHangTheSquash(t *testing.T) {
