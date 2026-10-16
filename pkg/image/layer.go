@@ -348,6 +348,9 @@ func (l *Layer) FilesByMIMEType(mimeTypes ...string) ([]file.Reference, error) {
 //
 // Deprecated: use SquashedSearchContext().SearchByMIMEType() instead.
 func (l *Layer) FilesByMIMETypeFromSquash(mimeTypes ...string) ([]file.Reference, error) {
+	if l.SquashedSearchContext == nil {
+		return nil, fmt.Errorf("layer has no squashed search context")
+	}
 	var refs []file.Reference
 	refVias, err := l.SquashedSearchContext.SearchByMIMEType(mimeTypes...)
 	if err != nil {
