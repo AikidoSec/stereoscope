@@ -2,17 +2,17 @@ package integration
 
 import (
 	"context"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anchore/stereoscope/internal/podman"
+	"github.com/anchore/stereoscope/internal/testutil"
 )
 
 func TestPodmanConnections(t *testing.T) {
@@ -26,10 +26,7 @@ func TestPodmanConnections(t *testing.T) {
 			name:        "ssh connection",
 			constructor: podman.ClientOverSSH,
 			setup: func(t *testing.T) {
-				cwd, err := os.Getwd()
-				require.NoErrorf(t, err, "unable to get cwd: %+v", err)
-
-				fixturesPath := filepath.Join(cwd, "test-fixtures", "podman")
+				fixturesPath := testutil.GetFixturePath(t, "podman")
 
 				cmd := exec.Command("make")
 				cmd.Dir = fixturesPath
@@ -53,7 +50,7 @@ func TestPodmanConnections(t *testing.T) {
 					}
 					cmd = exec.Command("make", "status")
 					cmd.Dir = fixturesPath
-					if err = runAndShowPassive(t, cmd); err == nil {
+					if err := runAndShowPassive(t, cmd); err == nil {
 						t.Log("podman is ready")
 						break
 					}
@@ -63,10 +60,7 @@ func TestPodmanConnections(t *testing.T) {
 
 			},
 			cleanup: func() {
-				cwd, err := os.Getwd()
-				assert.NoErrorf(t, err, "unable to get cwd: %+v", err)
-
-				fixturesPath := filepath.Join(cwd, "test-fixtures", "podman")
+				fixturesPath := testutil.GetFixturePath(t, "podman")
 
 				cmd := exec.Command("make", "stop")
 				cmd.Dir = fixturesPath
@@ -90,11 +84,11 @@ func TestPodmanConnections(t *testing.T) {
 			require.NoError(t, err)
 			assert.NotEmpty(t, c.ClientVersion())
 
-			p, err := c.Ping(context.Background())
+			p, err := c.Ping(context.Background(), client.PingOptions{})
 			require.NoError(t, err)
 			assert.NotNil(t, p)
 
-			version, err := c.ServerVersion(context.Background())
+			version, err := c.ServerVersion(context.Background(), client.ServerVersionOptions{})
 			require.NoError(t, err)
 			assert.NotEmpty(t, version)
 		})

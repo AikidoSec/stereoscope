@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 )
 
 func Test_newClient(t *testing.T) {
@@ -18,7 +18,7 @@ func Test_newClient(t *testing.T) {
 		{
 			name:           "Test newClient returns the correct default location",
 			providedSocket: "",
-			expectedSocket: "unix:///var/run/docker.sock",
+			expectedSocket: client.DefaultDockerHost,
 		},
 		{
 			name:           "Test newClient with runtime specific path",
@@ -43,17 +43,16 @@ func Test_newClient(t *testing.T) {
 			}
 			clientOpts := []client.Opt{
 				client.FromEnv,
-				client.WithAPIVersionNegotiation(),
 			}
 
-			client, err := newClient(c.providedSocket, clientOpts...)
+			apiClient, err := newClient(c.providedSocket, clientOpts...)
 			if err != nil {
 				t.Errorf("newClient() error = %v", err)
 				return
 			}
 
-			if client.DaemonHost() != c.expectedSocket {
-				t.Errorf("newClient() = %v, want %v", client.DaemonHost(), c.expectedSocket)
+			if apiClient.DaemonHost() != c.expectedSocket {
+				t.Errorf("newClient() = %v, want %v", apiClient.DaemonHost(), c.expectedSocket)
 			}
 		})
 	}

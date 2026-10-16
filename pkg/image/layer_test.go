@@ -1,12 +1,14 @@
 package image
 
 import (
+	"archive/tar"
 	"errors"
 	"io"
 	"strings"
 	"testing"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/random"
 	v1Types "github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/stretchr/testify/require"
 )
@@ -55,6 +57,53 @@ func fakeLayer(mediaType v1Types.MediaType, err error) v1.Layer {
 	}
 }
 
+// closeSpyLayer decorates a real v1.Layer, recording whether the reader returned by Uncompressed()
+// is closed. The reader still closes for real (Close is delegated), so only the observation is added.
+type closeSpyLayer struct {
+	v1.Layer
+	closed bool
+}
+
+func (l *closeSpyLayer) Uncompressed() (io.ReadCloser, error) {
+	rc, err := l.Layer.Uncompressed()
+	if err != nil {
+		return nil, err
+	}
+	return spyReadCloser{ReadCloser: rc, closed: &l.closed}, nil
+}
+
+type spyReadCloser struct {
+	io.ReadCloser
+	closed *bool
+}
+
+func (r spyReadCloser) Close() error {
+	*r.closed = true
+	return r.ReadCloser.Close()
+}
+
+// TestUncompressedCacheClosesReader guards against a regression where the reader returned by
+// layer.Uncompressed() was never closed.
+func TestUncompressedCacheClosesReader(t *testing.T) {
+	img, err := random.Image(1024, 1)
+	require.NoError(t, err)
+
+	layers, err := img.Layers()
+	require.NoError(t, err)
+	require.Len(t, layers, 1)
+
+	digest, err := layers[0].Digest()
+	require.NoError(t, err)
+
+	spy := &closeSpyLayer{Layer: layers[0]}
+	layer := Layer{layer: spy}
+	layer.Metadata.Digest = digest.String()
+
+	_, err = layer.uncompressedCache(t.TempDir())
+	require.NoError(t, err)
+	require.True(t, spy.closed, "expected uncompressedCache to close the layer reader to release the pull-limiter token")
+}
+
 func TestRead(t *testing.T) {
 	tests := []struct {
 		name            string
@@ -79,8 +128,44 @@ func TestRead(t *testing.T) {
 			wantErrContents: "no media type for you",
 		},
 		{
-			name:      "no error",
+			name:      "support OCI layer",
+			mediaType: v1Types.OCILayer,
+		},
+		{
+			name:      "support OCI uncompressed layer",
+			mediaType: v1Types.OCIUncompressedLayer,
+		},
+		{
+			name:      "support OCI restricted layer",
+			mediaType: v1Types.OCIRestrictedLayer,
+		},
+		{
+			name:      "support OCI uncompressed restricted layer",
+			mediaType: v1Types.OCIUncompressedRestrictedLayer,
+		},
+		{
+			name:      "support OCI zstd layer",
+			mediaType: v1Types.OCILayerZStd,
+		},
+		{
+			name:      "support docker tar.gz layer",
 			mediaType: v1Types.DockerLayer,
+		},
+		{
+			name:      "support docker foreign layer",
+			mediaType: v1Types.DockerForeignLayer,
+		},
+		{
+			name:      "support docker uncompressed layer",
+			mediaType: v1Types.DockerUncompressedLayer,
+		},
+		{
+			name:      "support docker tar.zstd layer",
+			mediaType: BuildKitZstdCompressedLayer,
+		},
+		{
+			name:      "support docker tar+zstd layer",
+			mediaType: BuildKitZstdCompressedLayerAlt,
 		},
 	}
 
@@ -88,7 +173,9 @@ func TestRead(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			layer := Layer{layer: fakeLayer(tt.mediaType, tt.mediaTypeErr)}
 			catalog := NewFileCatalog()
-			err := layer.Read(catalog, 0, t.TempDir())
+			dir := t.TempDir()
+			t.Cleanup(func() { _ = layer.close() })
+			err := layer.Read(catalog, 0, dir)
 			if tt.wantErrContents != "" {
 				require.ErrorContains(t, err, tt.wantErrContents)
 				return
@@ -96,4 +183,212 @@ func TestRead(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestIsSupportedLayerMediaType(t *testing.T) {
+	tests := []struct {
+		name      string
+		mediaType v1Types.MediaType
+		want      bool
+	}{
+		{
+			name:      "OCI layer",
+			mediaType: v1Types.OCILayer,
+			want:      true,
+		},
+		{
+			name:      "OCI uncompressed layer",
+			mediaType: v1Types.OCIUncompressedLayer,
+			want:      true,
+		},
+		{
+			name:      "OCI restricted layer",
+			mediaType: v1Types.OCIRestrictedLayer,
+			want:      true,
+		},
+		{
+			name:      "OCI uncompressed restricted layer",
+			mediaType: v1Types.OCIUncompressedRestrictedLayer,
+			want:      true,
+		},
+		{
+			name:      "OCI zstd layer",
+			mediaType: v1Types.OCILayerZStd,
+			want:      true,
+		},
+		{
+			name:      "Docker layer",
+			mediaType: v1Types.DockerLayer,
+			want:      true,
+		},
+		{
+			name:      "Docker foreign layer",
+			mediaType: v1Types.DockerForeignLayer,
+			want:      true,
+		},
+		{
+			name:      "Docker uncompressed layer",
+			mediaType: v1Types.DockerUncompressedLayer,
+			want:      true,
+		},
+		{
+			name:      "BuildKit zstd layer",
+			mediaType: BuildKitZstdCompressedLayer,
+			want:      true,
+		},
+		{
+			name:      "BuildKit zstd layer alt",
+			mediaType: BuildKitZstdCompressedLayerAlt,
+			want:      true,
+		},
+		{
+			name:      "Singularity squashfs layer",
+			mediaType: SingularitySquashFSLayer,
+			want:      true,
+		},
+		{
+			name:      "unsupported garbage type",
+			mediaType: "garbage",
+			want:      false,
+		},
+		{
+			name:      "unsupported helm chart",
+			mediaType: "application/vnd.cncf.helm.chart.content.v1.tar+gzip",
+			want:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isSupportedLayerMediaType(tt.mediaType)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestValidateLayerMediaTypes(t *testing.T) {
+	tests := []struct {
+		name            string
+		layers          []v1.Layer
+		wantErrContents string
+	}{
+		{
+			name: "all supported types",
+			layers: []v1.Layer{
+				fakeLayer(v1Types.OCILayer, nil),
+				fakeLayer(v1Types.DockerLayer, nil),
+			},
+		},
+		{
+			name: "one unsupported type",
+			layers: []v1.Layer{
+				fakeLayer(v1Types.OCILayer, nil),
+				fakeLayer("garbage", nil),
+			},
+			wantErrContents: "unsupported layer media type(s): layer 1: garbage",
+		},
+		{
+			name: "multiple unsupported types",
+			layers: []v1.Layer{
+				fakeLayer("garbage", nil),
+				fakeLayer(v1Types.OCILayer, nil),
+				fakeLayer("also-garbage", nil),
+			},
+			wantErrContents: "unsupported layer media type(s): layer 0: garbage, layer 2: also-garbage",
+		},
+		{
+			name: "media type error",
+			layers: []v1.Layer{
+				fakeLayer("", errors.New("no media type")),
+			},
+			wantErrContents: "unable to get media type for layer 0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateLayerMediaTypes(tt.layers)
+			if tt.wantErrContents != "" {
+				require.ErrorContains(t, err, tt.wantErrContents)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestLayerRead_ClaimedDiffIDsDoNotShareCache covers an image config that claims the same diff ID
+// for two different layers. The diff ID is what the image says about a layer, not something we
+// verified, so it cannot be the only thing keying the unpacked-layer cache: doing that lets one
+// layer be indexed from another layer's content, silently dropping files from the image.
+func TestLayerRead_ClaimedDiffIDsDoNotShareCache(t *testing.T) {
+	claimed := v1.Hash{Algorithm: "sha256", Hex: strings.Repeat("2", 64)}
+
+	img := readImageFromLayersWithConfig(t,
+		func(cfg *v1.ConfigFile) {
+			for idx := range cfg.RootFS.DiffIDs {
+				cfg.RootFS.DiffIDs[idx] = claimed
+			}
+		},
+		layerFromTarEntries(t, tarEntry{path: "only-in-layer-1.txt", typeFlag: tar.TypeReg, contents: "one"}),
+		layerFromTarEntries(t, tarEntry{path: "only-in-layer-2.txt", typeFlag: tar.TypeReg, contents: "two"}),
+	)
+
+	require.Len(t, img.Layers, 2)
+	require.Equal(t, claimed.String(), img.Layers[0].Metadata.Digest)
+	require.Equal(t, claimed.String(), img.Layers[1].Metadata.Digest)
+
+	// each layer must still be indexed from its own tar
+	require.True(t, img.Layers[0].Tree.HasPath("/only-in-layer-1.txt"))
+	require.False(t, img.Layers[0].Tree.HasPath("/only-in-layer-2.txt"))
+	require.True(t, img.Layers[1].Tree.HasPath("/only-in-layer-2.txt"))
+	require.False(t, img.Layers[1].Tree.HasPath("/only-in-layer-1.txt"))
+
+	require.True(t, img.SquashedTree().HasPath("/only-in-layer-1.txt"))
+	require.True(t, img.SquashedTree().HasPath("/only-in-layer-2.txt"))
+}
+
+// whiteout entries are changeset metadata: a layer's own tree keeps them (a merge reads them off the
+// upper tree), but no squashed tree may carry them, including the lowest layer's, which is not merged
+// into anything.
+func TestLayerRead_LowestLayerWhiteoutsAreNotSquashed(t *testing.T) {
+	img := readImageFromLayers(t,
+		layerFromTarEntries(t,
+			tarEntry{path: "etc/passwd", typeFlag: tar.TypeReg, contents: "root"},
+			tarEntry{path: "etc/.wh.shadow", typeFlag: tar.TypeReg},
+			tarEntry{path: "etc/.wh..wh..opq", typeFlag: tar.TypeReg},
+		),
+		layerFromTarEntries(t, tarEntry{path: "etc/hostname", typeFlag: tar.TypeReg, contents: "host"}),
+	)
+
+	require.True(t, img.Layers[0].Tree.HasPath("/etc/.wh.shadow"), "the layer diff tree should keep the marker")
+	require.True(t, img.Layers[0].Tree.HasPath("/etc/.wh..wh..opq"), "the layer diff tree should keep the opaque marker")
+	require.False(t, img.Layers[0].SquashedTree.HasPath("/etc/.wh.shadow"), "the lowest layer squash leaked a whiteout marker")
+	require.False(t, img.Layers[0].SquashedTree.HasPath("/etc/.wh..wh..opq"), "the lowest layer squash leaked an opaque marker")
+	require.False(t, img.SquashedTree().HasPath("/etc/.wh.shadow"), "the image squash leaked a whiteout marker")
+	require.False(t, img.SquashedTree().HasPath("/etc/.wh..wh..opq"), "the image squash leaked an opaque marker")
+	require.True(t, img.SquashedTree().HasPath("/etc/passwd"))
+	require.True(t, img.SquashedTree().HasPath("/etc/hostname"))
+}
+
+// an entry that merely starts with the opaque marker is an ordinary whiteout of the sibling that follows the
+// ".wh." prefix, not a marker for its parent. Treating it as opaque deletes the whole parent directory, and at
+// the image root the parent is "/", which cannot be removed, so the error fails the entire read.
+func TestLayerRead_OpaqueMarkerPrefixDoesNotAbortTheRead(t *testing.T) {
+	img, err := tryReadImageFromLayers(t,
+		layerFromTarEntries(t,
+			tarEntry{path: "etc/passwd", typeFlag: tar.TypeReg, contents: "root"},
+			tarEntry{path: "etc/hostname", typeFlag: tar.TypeReg, contents: "host"},
+		),
+		layerFromTarEntries(t,
+			tarEntry{path: "etc/.wh..wh..opqX", typeFlag: tar.TypeReg},
+			tarEntry{path: ".wh..wh..opqX", typeFlag: tar.TypeReg},
+		),
+	)
+
+	require.NoError(t, err, "a crafted opaque-prefix entry must not fail the read")
+	require.True(t, img.SquashedTree().HasPath("/etc/passwd"), "/etc was erased by a non-opaque marker")
+	require.True(t, img.SquashedTree().HasPath("/etc/hostname"), "/etc was erased by a non-opaque marker")
+	require.False(t, img.SquashedTree().HasPath("/etc/.wh..wh..opqX"), "the image squash leaked a whiteout marker")
+	require.False(t, img.SquashedTree().HasPath("/.wh..wh..opqX"), "the image squash leaked a whiteout marker")
 }

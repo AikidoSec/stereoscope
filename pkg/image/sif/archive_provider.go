@@ -2,6 +2,7 @@ package sif
 
 import (
 	"context"
+	"errors"
 
 	"github.com/google/go-containerregistry/pkg/v1/partial"
 
@@ -31,7 +32,7 @@ func (p *singularityImageProvider) Name() string {
 }
 
 // Provide returns an Image that represents a Singularity Image Format (SIF) image.
-func (p *singularityImageProvider) Provide(_ context.Context) (*image.Image, error) {
+func (p *singularityImageProvider) Provide(ctx context.Context) (*image.Image, error) {
 	// We need to map the SIF to a GGCR v1.Image. Start with an implementation of the GGCR
 	// partial.UncompressedImageCore interface.
 	si, err := newSIFImage(p.path)
@@ -58,9 +59,10 @@ func (p *singularityImageProvider) Provide(_ context.Context) (*image.Image, err
 	}
 
 	out := image.New(ui, p.tmpDirGen, contentCacheDir, metadata...)
-	err = out.Read()
+	err = out.Read(ctx)
 	if err != nil {
-		return nil, err
+		cleanErr := out.Cleanup()
+		return nil, errors.Join(err, cleanErr)
 	}
 	return out, err
 }

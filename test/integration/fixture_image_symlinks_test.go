@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package integration
 
@@ -66,7 +65,11 @@ func TestImageSymlinks(t *testing.T) {
 
 	expectedSet := collections.TaggedValueSet[image.Provider]{}.
 		Join(stereoscope.ImageProviders(stereoscope.ImageProviderConfig{})...).
-		Remove(image.OciRegistrySource)
+		Remove(image.OciRegistrySource).
+		// containers-storage has no fixture-loading path here (it reads from a real containers-storage
+		// store, not the docker/oci/sif fixtures this file loads); it's covered by the dedicated
+		// containers-storage unit and integration tests instead.
+		Remove(image.ContainersStorageSource)
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -153,11 +156,15 @@ func assertImageSymlinkLinkResolution(t *testing.T, i *image.Image) {
 
 	tests := []linkFetchConfig{
 		// LAYER 0 > FROM busybox:latest (hardlink test)
+		// /bin/busybox and /bin/[ are two names for one inode. the tar gives the data section to
+		// /bin/[ (alphabetically first) and emits /bin/busybox as a hardlink header, but neither name
+		// is a link to the other: both are the file. So /bin/busybox resolves to itself, not to
+		// /bin/[, and reading either name returns the same bytes.
 		{
 			linkLayer:        0,
 			linkPath:         "/bin/busybox",
 			resolveLayer:     0,
-			expectedPath:     "/bin/[",
+			expectedPath:     "/bin/busybox",
 			perspectiveLayer: 0,
 		},
 

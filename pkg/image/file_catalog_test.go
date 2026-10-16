@@ -1,6 +1,3 @@
-//go:build !windows
-// +build !windows
-
 package image
 
 import (
@@ -12,6 +9,8 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -23,17 +22,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/anchore/stereoscope/internal/testutil"
 	"github.com/anchore/stereoscope/pkg/file"
 	"github.com/anchore/stereoscope/pkg/filetree"
-)
-
-const (
-	fixturesPath = "test-fixtures"
-)
-
-var (
-	fixturesGeneratorsPath = path.Join(fixturesPath, "generators")
-	tarCachePath           = path.Join(fixturesPath, "tar-cache")
 )
 
 func basicMetadataComparer(x, y file.Metadata) bool {
@@ -132,6 +123,7 @@ func TestFileCatalog_Open(t *testing.T) {
 	}
 
 	tr, err := file.NewTarIndex(fixtureFile.Name(), nil)
+	t.Cleanup(func() { _ = tr.Close() })
 	require.NoError(t, err)
 
 	layer := &Layer{
@@ -219,12 +211,13 @@ func TestFileCatalog_GetByExtension(t *testing.T) {
 	fileCatalog := NewFileCatalog()
 	var size int64
 
-	// we don't need the index itself, just the side effect on the file catalog after indexing
-	_, err := file.NewTarIndex(
+	// the catalog is what this test is after, but the index owns the tar descriptor until it is closed
+	index, err := file.NewTarIndex(
 		fixtureTarFile.Name(),
 		layerTarIndexer(ft, fileCatalog, &size, nil, nil),
 	)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = index.Close() })
 
 	tests := []struct {
 		name    string
@@ -386,12 +379,13 @@ func TestFileCatalog_GetByBasename(t *testing.T) {
 	fileCatalog := NewFileCatalog()
 	var size int64
 
-	// we don't need the index itself, just the side effect on the file catalog after indexing
-	_, err := file.NewTarIndex(
+	// the catalog is what this test is after, but the index owns the tar descriptor until it is closed
+	index, err := file.NewTarIndex(
 		fixtureTarFile.Name(),
 		layerTarIndexer(ft, fileCatalog, &size, nil, nil),
 	)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = index.Close() })
 
 	tests := []struct {
 		name    string
@@ -490,12 +484,13 @@ func TestFileCatalog_GetByBasenameGlob(t *testing.T) {
 	fileCatalog := NewFileCatalog()
 	var size int64
 
-	// we don't need the index itself, just the side effect on the file catalog after indexing
-	_, err := file.NewTarIndex(
+	// the catalog is what this test is after, but the index owns the tar descriptor until it is closed
+	index, err := file.NewTarIndex(
 		fixtureTarFile.Name(),
 		layerTarIndexer(ft, fileCatalog, &size, nil, nil),
 	)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = index.Close() })
 
 	tests := []struct {
 		name    string
@@ -584,6 +579,9 @@ func TestFileCatalog_GetByBasenameGlob(t *testing.T) {
 			if err != nil {
 				return
 			}
+			sortPath := func(a, b filetree.IndexEntry) int { return strings.Compare(a.Path, b.Path) }
+			slices.SortFunc(actual, sortPath)
+			slices.SortFunc(tt.want, sortPath)
 			if d := cmp.Diff(tt.want, actual,
 				cmpopts.EquateEmpty(),
 				cmpopts.IgnoreUnexported(file.Reference{}),
@@ -602,12 +600,13 @@ func TestFileCatalog_GetByMimeType(t *testing.T) {
 	fileCatalog := NewFileCatalog()
 	var size int64
 
-	// we don't need the index itself, just the side effect on the file catalog after indexing
-	_, err := file.NewTarIndex(
+	// the catalog is what this test is after, but the index owns the tar descriptor until it is closed
+	index, err := file.NewTarIndex(
 		fixtureTarFile.Name(),
 		layerTarIndexer(ft, fileCatalog, &size, nil, nil),
 	)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = index.Close() })
 
 	tests := []struct {
 		name    string
@@ -703,12 +702,13 @@ func TestFileCatalog_GetBasenames(t *testing.T) {
 	fileCatalog := NewFileCatalog()
 	var size int64
 
-	// we don't need the index itself, just the side effect on the file catalog after indexing
-	_, err := file.NewTarIndex(
+	// the catalog is what this test is after, but the index owns the tar descriptor until it is closed
+	index, err := file.NewTarIndex(
 		fixtureTarFile.Name(),
 		layerTarIndexer(ft, fileCatalog, &size, nil, nil),
 	)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = index.Close() })
 
 	tests := []struct {
 		name string
@@ -736,14 +736,23 @@ func TestFileCatalog_GetBasenames(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			actual := fileCatalog.Basenames()
-			assert.ElementsMatchf(t, tt.want, actual, "diff: %s", cmp.Diff(tt.want, actual))
+			for _, name := range tt.want {
+				e, err := fileCatalog.GetByBasenameGlob(name)
+				require.NoError(t, err)
+				require.NotEmpty(t, e)
+			}
 		})
 	}
 }
 
 func getTarFixture(t *testing.T, name string) *os.File {
+	if runtime.GOOS == "windows" {
+		// the generator scripts build the tar inside a linux container via bash
+		t.Skip("tar fixture generation requires bash and linux docker")
+	}
 	generatorScriptName := name + ".sh"
+	fixturesGeneratorsPath := testutil.GetFixturePath(t, "generators")
+	tarCachePath := testutil.GetFixturePath(t, "tar-cache")
 	generatorScriptPath := path.Join(fixturesGeneratorsPath, generatorScriptName)
 	if !fileExists(t, generatorScriptPath) {
 		t.Fatalf("no tar generator script for fixture '%s'", generatorScriptPath)

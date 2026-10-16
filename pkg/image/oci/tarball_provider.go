@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
+	"github.com/anchore/stereoscope/internal/log"
 	"github.com/anchore/stereoscope/pkg/file"
 	"github.com/anchore/stereoscope/pkg/image"
 )
@@ -13,9 +15,19 @@ const Archive image.Source = image.OciTarballSource
 
 // NewArchiveProvider creates a new provider instance for the specific image tarball already at the given path.
 func NewArchiveProvider(tmpDirGen *file.TempDirGenerator, path string) image.Provider {
+	return NewArchiveProviderWithPlatform(tmpDirGen, path, nil)
+}
+
+// NewArchiveProviderWithPlatform creates a new provider instance for the specific image tarball already at the given path,
+// with the given platform used to select an image from a multiplatform layout. The platform is also enforced for
+// single-platform layouts: Provide returns an *image.ErrPlatformMismatch if the image does not match it. A nil
+// platform selects the only image in a single-platform layout, or the host platform in a multiplatform one.
+// The platform should come from image.NewPlatform so that OS and architecture aliases are normalized.
+func NewArchiveProviderWithPlatform(tmpDirGen *file.TempDirGenerator, path string, platform *image.Platform) image.Provider {
 	return &tarballImageProvider{
 		tmpDirGen: tmpDirGen,
 		path:      path,
+		platform:  platform,
 	}
 }
 
@@ -23,6 +35,7 @@ func NewArchiveProvider(tmpDirGen *file.TempDirGenerator, path string) image.Pro
 type tarballImageProvider struct {
 	tmpDirGen *file.TempDirGenerator
 	path      string
+	platform  *image.Platform
 }
 
 func (p *tarballImageProvider) Name() string {
@@ -37,15 +50,21 @@ func (p *tarballImageProvider) Provide(ctx context.Context) (*image.Image, error
 	if err != nil {
 		return nil, fmt.Errorf("unable to open OCI tarball: %w", err)
 	}
+	defer f.Close()
 
 	tempDir, err := p.tmpDirGen.NewDirectory("oci-tarball-image")
 	if err != nil {
 		return nil, err
 	}
 
+	log.WithFields("file", p.path, "tempDir", tempDir).Trace("extracting OCI tar file to tempdir")
+	startTime := time.Now()
+
 	if err = file.UntarToDirectory(f, tempDir); err != nil {
 		return nil, err
 	}
 
-	return NewDirectoryProvider(p.tmpDirGen, tempDir).Provide(ctx)
+	log.WithFields("file", p.path, "tempDir", tempDir, "time", time.Since(startTime)).Debug("extracted OCI tar file to tempdir")
+
+	return NewDirectoryProviderWithPlatform(p.tmpDirGen, tempDir, p.platform).Provide(ctx)
 }

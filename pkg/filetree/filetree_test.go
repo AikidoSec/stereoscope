@@ -442,6 +442,126 @@ func TestFileTree_Merge_OpaqueWhiteout_NoLowerDirectory(t *testing.T) {
 	}
 }
 
+// an opaque directory clears the lower tree's children even when the path to it is a link cycle. The
+// children are still real nodes at their own real paths.
+func TestFileTree_Merge_OpaqueWhiteoutOverLinkCycle(t *testing.T) {
+	lower := New()
+	_, err := lower.AddSymLink("/a", "/b")
+	require.NoError(t, err)
+	_, err = lower.AddSymLink("/b", "/a")
+	require.NoError(t, err)
+	_, err = lower.AddFile("/a/deleted.txt")
+	require.NoError(t, err)
+
+	upper := New()
+	_, err = upper.AddFile(file.Path("/a/" + file.OpaqueWhiteout))
+	require.NoError(t, err)
+	_, err = upper.AddFile("/a/kept.txt")
+	require.NoError(t, err)
+
+	require.NoError(t, lower.Merge(upper))
+
+	assert.True(t, lower.HasPath("/a/kept.txt"), "the upper tree's file should be present")
+	assert.Falsef(t, lower.HasPath("/a/deleted.txt"),
+		"the opaque directory did not clear the lower tree; real paths are %v", lower.AllRealPaths())
+
+	// the upper directory replaced the link, so the other half of the cycle now resolves into it
+	n, err := lower.node("/a", linkResolutionStrategy{})
+	require.NoError(t, err)
+	require.True(t, n.HasFileNode())
+	assert.Equal(t, file.TypeDirectory, n.FileNode.FileType, "the upper tree's directory should have replaced the link")
+	assert.True(t, lower.HasPath("/b/kept.txt"), "the surviving link should resolve into the new directory")
+}
+
+// an opaque directory clears the link's own children and stops there. The target is a separate
+// directory an overlay mount leaves alone, so clearing it would delete files still visible there.
+func TestFileTree_Merge_OpaqueWhiteoutOverResolvableLink(t *testing.T) {
+	lower := New()
+	_, err := lower.AddSymLink("/a", "/real")
+	require.NoError(t, err)
+	_, err = lower.AddFile("/real/target-child.txt")
+	require.NoError(t, err)
+	_, err = lower.AddFile("/a/link-child.txt")
+	require.NoError(t, err)
+
+	upper := New()
+	_, err = upper.AddFile(file.Path("/a/" + file.OpaqueWhiteout))
+	require.NoError(t, err)
+
+	require.NoError(t, lower.Merge(upper))
+
+	assert.Truef(t, lower.HasPath("/real/target-child.txt"),
+		"the link target is a separate directory and must survive; real paths are %v", lower.AllRealPaths())
+	assert.Falsef(t, lower.HasPath("/a/link-child.txt"),
+		"the link's own children should be cleared; real paths are %v", lower.AllRealPaths())
+}
+
+// merged-usr shape: the opaque directory's ancestor is a link (/lib -> /usr/lib). The clear does not
+// follow it, so /usr/lib keeps its contents and stays reachable by its own real path.
+func TestFileTree_Merge_OpaqueWhiteoutUnderResolvableLinkAncestor(t *testing.T) {
+	lower := New()
+	_, err := lower.AddSymLink("/lib", "/usr/lib")
+	require.NoError(t, err)
+	_, err = lower.AddFile("/usr/lib/jvm/old.txt")
+	require.NoError(t, err)
+
+	upper := New()
+	_, err = upper.AddFile(file.Path("/lib/jvm/" + file.OpaqueWhiteout))
+	require.NoError(t, err)
+	_, err = upper.AddFile("/lib/jvm/new.txt")
+	require.NoError(t, err)
+
+	require.NoError(t, lower.Merge(upper))
+
+	assert.Truef(t, lower.HasPath("/usr/lib/jvm/old.txt"),
+		"the link target must keep its contents; real paths are %v", lower.AllRealPaths())
+	assert.True(t, lower.HasPath("/lib/jvm/new.txt"), "the upper tree's file should be present")
+}
+
+// a link cycle in an ancestor resolves to no node, so there is nothing to clear and the squash
+// carries on.
+func TestFileTree_Merge_OpaqueWhiteoutUnderLinkCycleAncestor(t *testing.T) {
+	lower := New()
+	_, err := lower.AddSymLink("/x", "/y")
+	require.NoError(t, err)
+	_, err = lower.AddSymLink("/y", "/x")
+	require.NoError(t, err)
+	_, err = lower.AddFile("/keep.txt")
+	require.NoError(t, err)
+
+	upper := New()
+	_, err = upper.AddFile(file.Path("/x/y/z/" + file.OpaqueWhiteout))
+	require.NoError(t, err)
+
+	require.NoError(t, lower.Merge(upper))
+
+	assert.True(t, lower.HasPath("/keep.txt"), "an unrelated file must survive the malformed link")
+}
+
+// a whiteout under a malformed link must not fail the squash. The upper layer carries the link, so
+// grafting it re-forms the cycle instead of breaking it, which is what reaches ancestor resolution.
+func TestFileTree_Merge_WhiteoutOverLinkCycle(t *testing.T) {
+	lower := New()
+	_, err := lower.AddSymLink("/b", "/a")
+	require.NoError(t, err)
+	_, err = lower.AddFile("/a/gone.txt")
+	require.NoError(t, err)
+	_, err = lower.AddFile("/keep.txt")
+	require.NoError(t, err)
+
+	upper := New()
+	_, err = upper.AddSymLink("/a", "/b")
+	require.NoError(t, err)
+	_, err = upper.AddFile("/a/.wh.gone.txt")
+	require.NoError(t, err)
+
+	require.NoError(t, lower.Merge(upper), "a malformed link must not fail the squash")
+
+	assert.True(t, lower.HasPath("/keep.txt"), "an unrelated file must survive the malformed link")
+	assert.Falsef(t, lower.HasPath("/a/gone.txt"),
+		"the whiteout target should not survive; real paths are %v", lower.AllRealPaths())
+}
+
 func TestFileTree_Merge_Whiteout(t *testing.T) {
 	tr1 := New()
 	tr1.AddFile("/home/wagoodman/awesome/file.txt")
@@ -1195,7 +1315,7 @@ func TestFileTree_MaximumLinkResolutionExceeded(t *testing.T) {
 	ref, err := tr.AddFile("/usr/bin/ksh")
 
 	// we hard code this in filetree to 100
-	for i := 0; i < maxLinkResolutionDepth; i++ {
+	for i := range maxLinkResolutionDepth {
 		_, err = tr.AddSymLink(
 			file.Path(fmt.Sprintf("/usr/bin/ksh%d", i)),
 			file.Path(fmt.Sprintf("/usr/bin/ksh%d", i+1)),
@@ -1301,4 +1421,59 @@ func TestFileTree_AllFiles(t *testing.T) {
 		})
 	}
 
+}
+
+func TestFileTree_FilesByGlob_SkipsLinkCycles(t *testing.T) {
+	tr := New()
+	for _, p := range []file.Path{"/usr/bin/a-before", "/usr/bin/zz-after"} {
+		_, err := tr.AddFile(p)
+		require.NoError(t, err)
+	}
+	_, err := tr.AddSymLink("/usr/bin/xz", "/usr/bin/xzcat")
+	require.NoError(t, err)
+	_, err = tr.AddSymLink("/usr/bin/xzcat", "/usr/bin/xz")
+	require.NoError(t, err)
+
+	refs, err := tr.FilesByGlob("/usr/bin/*")
+	require.NoError(t, err)
+
+	var paths []string
+	for _, ref := range refs {
+		paths = append(paths, string(ref.RealPath))
+	}
+	require.ElementsMatch(t, []string{"/usr/bin/a-before", "/usr/bin/zz-after"}, paths)
+}
+
+// resolving one specific path is not enumeration: these callers still need to know the image is malformed.
+func TestFileTree_File_StillErrorsOnLinkCycle(t *testing.T) {
+	tr := New()
+	_, err := tr.AddSymLink("/usr/bin/xz", "/usr/bin/xzcat")
+	require.NoError(t, err)
+	_, err = tr.AddSymLink("/usr/bin/xzcat", "/usr/bin/xz")
+	require.NoError(t, err)
+
+	_, _, err = tr.File("/usr/bin/xz", FollowBasenameLinks)
+	require.ErrorIs(t, err, ErrLinkCycleDetected)
+}
+
+// ListPaths is enumeration and is on the exported Reader interface, so a malformed link must yield an empty
+// listing rather than an error that the caller has to know how to classify.
+func TestFileTree_ListPaths_SkipsLinkCycles(t *testing.T) {
+	tr := New()
+	for from, to := range map[file.Path]file.Path{"/x": "/y", "/y": "/x"} {
+		_, err := tr.AddSymLink(from, to)
+		require.NoError(t, err)
+	}
+	_, err := tr.AddFile("/usr/bin/keep")
+	require.NoError(t, err)
+
+	// the cycle itself resolves to nothing, but must not fail the caller...
+	paths, err := tr.ListPaths("/x")
+	require.NoError(t, err)
+	require.Empty(t, paths)
+
+	// ...and an unrelated directory must still list normally
+	paths, err = tr.ListPaths("/usr/bin")
+	require.NoError(t, err)
+	require.Equal(t, []file.Path{"/usr/bin/keep"}, paths)
 }

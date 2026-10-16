@@ -1,6 +1,3 @@
-//go:build !windows
-// +build !windows
-
 package file
 
 import (
@@ -12,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/anchore/stereoscope/internal/testutil"
 )
 
 func assertMetadataEqual(t *testing.T, expected, actual Metadata) {
@@ -128,7 +127,7 @@ func TestFileMetadataFromTar(t *testing.T) {
 			LinkDestination: "",
 			UserID:          1337,
 			GroupID:         5432,
-			MIMEType:        "text/plain",
+			MIMEType:        "text/x-shellscript",
 			FileInfo: ManualInfo{
 				NameValue:    "file-3.txt",
 				SizeValue:    11,
@@ -141,8 +140,11 @@ func TestFileMetadataFromTar(t *testing.T) {
 	var actual []Metadata
 	visitor := func(entry TarFileEntry) error {
 		var contents io.Reader
-		if strings.HasSuffix(entry.Header.Name, ".txt") {
+		switch {
+		case entry.Header.Name == "path/file-3.txt":
 			contents = strings.NewReader("#!/usr/bin/env bash\necho 'awesome script'")
+		case strings.HasSuffix(entry.Header.Name, ".txt"):
+			contents = strings.NewReader("echo 'not awesome script'")
 		}
 
 		entry.Header.ModTime = time.Time{}
@@ -164,39 +166,40 @@ func TestFileMetadataFromTar(t *testing.T) {
 func TestFileMetadataFromPath(t *testing.T) {
 
 	tests := []struct {
-		path             string
+		fixturePath      string
 		expectedType     Type
 		expectedMIMEType string
 	}{
 		{
-			path:             "test-fixtures/symlinks-simple/readme",
+			fixturePath:      "symlinks-simple/readme",
 			expectedType:     TypeRegular,
 			expectedMIMEType: "text/plain",
 		},
 		{
-			path:             "test-fixtures/symlinks-simple/link_to_new_readme",
+			fixturePath:      "symlinks-simple/link_to_new_readme",
 			expectedType:     TypeSymLink,
 			expectedMIMEType: "",
 		},
 		{
-			path:             "test-fixtures/symlinks-simple/link_to_link_to_new_readme",
+			fixturePath:      "symlinks-simple/link_to_link_to_new_readme",
 			expectedType:     TypeSymLink,
 			expectedMIMEType: "",
 		},
 		{
-			path:             "test-fixtures/symlinks-simple",
+			fixturePath:      "symlinks-simple",
 			expectedType:     TypeDirectory,
 			expectedMIMEType: "",
 		},
 	}
 	for _, test := range tests {
-		t.Run(test.path, func(t *testing.T) {
-			info, err := os.Lstat(test.path)
+		t.Run(test.fixturePath, func(t *testing.T) {
+			fullPath := testutil.GetFixturePath(t, test.fixturePath)
+			info, err := os.Lstat(fullPath)
 			require.NoError(t, err)
 
-			actual := NewMetadataFromPath(test.path, info)
-			assert.Equal(t, test.expectedMIMEType, actual.MIMEType, "unexpected MIME type for %s", test.path)
-			assert.Equal(t, test.expectedType, actual.Type, "unexpected type for %s", test.path)
+			actual := NewMetadataFromPath(fullPath, info)
+			assert.Equal(t, test.expectedMIMEType, actual.MIMEType, "unexpected MIME type for %s", fullPath)
+			assert.Equal(t, test.expectedType, actual.Type, "unexpected type for %s", fullPath)
 		})
 	}
 }

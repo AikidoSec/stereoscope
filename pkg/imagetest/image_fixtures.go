@@ -3,6 +3,7 @@ package imagetest
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -10,19 +11,21 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/logrusorgru/aurora"
 	"github.com/stretchr/testify/require"
 
-	"github.com/anchore/go-testutils"
 	"github.com/anchore/stereoscope"
 	"github.com/anchore/stereoscope/internal/containerd"
+	"github.com/anchore/stereoscope/internal/testutil"
 	"github.com/anchore/stereoscope/pkg/image"
 )
 
-const (
-	CacheDir    = testutils.TestFixturesDir + string(filepath.Separator) + "cache"
-	ImagePrefix = "stereoscope-fixture"
-)
+const ImagePrefix = "stereoscope-fixture"
+
+// getCacheDir returns the path to the image cache directory, automatically migrating
+// from the legacy "test-fixtures/cache" directory to "testdata/cache" if needed.
+func getCacheDir(t testing.TB) string {
+	return testutil.GetFixturePath(t, "cache")
+}
 
 func PrepareFixtureImage(t testing.TB, source, name string) string {
 	t.Helper()
@@ -68,8 +71,8 @@ func GetFixtureImage(t testing.TB, source, name string) *image.Image {
 		// if request is docker-archive, get a bit of extra info about the tar path
 		info := ""
 		const dockerArchivePrefix = "docker-archive:"
-		if strings.HasPrefix(request, dockerArchivePrefix) {
-			tarPath := strings.TrimPrefix(request, dockerArchivePrefix)
+		if after, ok := strings.CutPrefix(request, dockerArchivePrefix); ok {
+			tarPath := after
 			info = fmt.Sprintf(" (%s)", fileInfo(tarPath))
 		}
 		t.Fatalf("error getting fixture image: '%s' '%s' with request '%s'%s: %v", source, name, request, info, err)
@@ -82,16 +85,16 @@ func GetFixtureImage(t testing.TB, source, name string) *image.Image {
 
 func GetGoldenFixtureImage(t testing.TB, name string) *image.Image {
 	imageName, _ := getFixtureImageInfo(t, name)
-	tarFileName := imageName + testutils.GoldenFileExt
-	tarPath := getFixtureImageTarPath(t, name, testutils.GoldenFileDirPath, tarFileName)
+	tarFileName := imageName + testutil.GoldenFileExt
+	tarPath := getFixtureImageTarPath(t, name, testutil.GoldenFileDirPath, tarFileName)
 	return getFixtureImageFromTar(t, tarPath)
 }
 
 func UpdateGoldenFixtureImage(t testing.TB, name string) {
-	t.Log(aurora.Reverse(aurora.Red("!!! UPDATING GOLDEN FIXTURE IMAGE !!!")), name)
+	t.Log(testutil.DangerText("!!! UPDATING GOLDEN FIXTURE IMAGE !!!"), name)
 
 	imageName, _ := getFixtureImageInfo(t, name)
-	goldenTarFilePath := path.Join(testutils.GoldenFileDirPath, imageName+testutils.GoldenFileExt)
+	goldenTarFilePath := path.Join(testutil.GoldenFileDirPath, imageName+testutil.GoldenFileExt)
 	tarPath := GetFixtureImageTarPath(t, name)
 	copyFile(t, tarPath, goldenTarFilePath)
 }
@@ -117,6 +120,68 @@ func skopeoCopyDockerArchiveToPath(t testing.TB, dockerArchivePath, destination 
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("skopeo failed: %+v", err)
 	}
+}
+
+// PrepareMultiplatformFixtureImage pulls a multiplatform image from a registry and stores it as
+// an OCI directory or OCI tarball, preserving the multiplatform index. Returns the local path.
+func PrepareMultiplatformFixtureImage(t testing.TB, source, remoteImage string) string {
+	t.Helper()
+
+	if !isSkopeoAvailable() {
+		t.Fatalf("cannot find skopeo executable")
+	}
+
+	cacheDir := getCacheDir(t)
+	if !dirExists(t, cacheDir) {
+		err := os.MkdirAll(cacheDir, 0o755)
+		if err != nil {
+			t.Fatalf("could not create cache dir (%s): %+v", cacheDir, err)
+		}
+	}
+
+	// create a safe filename from the remote image reference
+	safeName := strings.NewReplacer("/", "_", ":", "-", ".", "_").Replace(remoteImage)
+
+	var location, transport string
+	switch source {
+	case image.OciDirectorySource:
+		location = path.Join(cacheDir, "multiplatform-oci-dir-"+safeName)
+		transport = "oci"
+	case image.OciTarballSource:
+		location = path.Join(cacheDir, "multiplatform-oci-archive-"+safeName+".tar")
+		transport = "oci-archive"
+	default:
+		t.Fatalf("PrepareMultiplatformFixtureImage does not support source: %s", source)
+	}
+
+	if _, err := os.Stat(location); os.IsNotExist(err) {
+		src := fmt.Sprintf("docker://%s", remoteImage)
+		// copy to a staging path and rename on success, so an interrupted copy can't leave a partial
+		// fixture behind that every later run would treat as a valid cache hit
+		staging := location + ".tmp"
+		if err := os.RemoveAll(staging); err != nil {
+			t.Fatalf("could not clear staging path (%s): %+v", staging, err)
+		}
+		// --preserve-digests ensures that the image manifests will remain the same.
+		// Skopeo will error if the source image is not in the OCI format, since it will
+		// have to convert it to OCI format, which would change the digests of the manifests.
+		cmd := exec.Command("skopeo", "copy", "--insecure-policy", "--all", "--preserve-digests", "--retry-times=3", src, fmt.Sprintf("%s:%s", transport, staging))
+		cmd.Env = os.Environ()
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		if err := cmd.Run(); err != nil {
+			_ = os.RemoveAll(staging)
+			t.Fatalf("skopeo copy failed for multiplatform image %q: %+v", remoteImage, err)
+		}
+		if err := os.Rename(staging, location); err != nil {
+			t.Fatalf("could not move multiplatform fixture into place (%s): %+v", location, err)
+		}
+	} else {
+		t.Logf("using cached multiplatform fixture: %s", location)
+	}
+
+	return location
 }
 
 func getFixtureImageFromTar(t testing.TB, tarPath string) *image.Image {
@@ -158,7 +223,7 @@ func loadFixtureInContainerEngine(t testing.TB, name string,
 	fullImageName := fmt.Sprintf("%s:%s", imageName, imageVersion)
 
 	if !hasImage(fullImageName) {
-		contextPath := path.Join(testutils.TestFixturesDir, name)
+		contextPath := testutil.GetFixturePath(t, name)
 		build(t, contextPath, imageName, imageVersion)
 	}
 
@@ -171,17 +236,17 @@ func getFixtureImageTarPath(t testing.TB, fixtureName, tarStoreDir, tarFileName 
 	tarPath := path.Join(tarStoreDir, tarFileName)
 
 	// create the cache dir if it does not already exist...
-	if !dirExists(t, CacheDir) {
-		err := os.Mkdir(CacheDir, 0o755)
+	if !dirExists(t, getCacheDir(t)) {
+		err := os.MkdirAll(getCacheDir(t), 0o755)
 		if err != nil {
-			t.Fatalf("could not create tar cache dir (%s): %+v", CacheDir, err)
+			t.Fatalf("could not create tar cache dir (%s): %+v", getCacheDir(t), err)
 		}
 	}
 
 	// if the image tar does not exist, make it
 	if !fileExists(t, tarPath) {
 		if !isImageInDocker(fullImageName) {
-			contextPath := path.Join(testutils.TestFixturesDir, fixtureName)
+			contextPath := testutil.GetFixturePath(t, fixtureName)
 			buildDockerImage(t, contextPath, imageName, imageVersion)
 		}
 
@@ -207,11 +272,11 @@ func fileInfo(filePath string) string {
 func GetFixtureImageTarPath(t testing.TB, name string) string {
 	imageName, imageVersion := getFixtureImageInfo(t, name)
 	tarFileName := fmt.Sprintf("%s-%s.tar", imageName, imageVersion)
-	return getFixtureImageTarPath(t, name, CacheDir, tarFileName)
+	return getFixtureImageTarPath(t, name, getCacheDir(t), tarFileName)
 }
 
 func fixtureVersion(t testing.TB, name string) string {
-	contextPath := path.Join(testutils.TestFixturesDir, name)
+	contextPath := testutil.GetFixturePath(t, name)
 	dockerfileHash := dirHash(t, contextPath)
 	return dockerfileHash
 }
@@ -289,32 +354,28 @@ func buildContainerdImage(t testing.TB, contextDir, name, tag string) {
 
 func saveImage(t testing.TB, image, path string) error {
 	t.Logf("saveImage running: docker image save %s", image)
-	outfile, err := os.Create(path)
-	if err != nil {
-		t.Fatal("unable to create file for docker image tar:", err)
-	}
-	defer func() {
-		err := outfile.Close()
-		if err != nil {
-			t.Fatalf("unable to close file path=%q : %+v", path, err)
-		}
-	}()
 
-	// note: we are not using -o since some CI providers need root access for the docker client, however,
-	// we don't want the resulting tar to be owned by root, thus we write the file piped from stdout.
-	cmd := exec.Command("docker", "image", "save", image)
-	cmd.Env = os.Environ()
+	// the tar is written atomically since the same cache path can be shared by several test processes (e.g. `go test`
+	// running multiple packages that resolve fixtures from one testdata dir). Callers check for the tar and then save
+	// it, so two processes can both decide to save; writing in place would let one process truncate a tar that
+	// another has already finished and is about to read.
+	return writeFileAtomic(path, func(w io.Writer) error {
+		// note: we are not using -o since some CI providers need root access for the docker client, however,
+		// we don't want the resulting tar to be owned by root, thus we write the file piped from stdout.
+		cmd := exec.Command("docker", "image", "save", image)
+		cmd.Env = os.Environ()
 
-	cmd.Stdout = outfile
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	return cmd.Run()
+		cmd.Stdout = w
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		return cmd.Run()
+	})
 }
 
 func GetFixtureImageSIFPath(t testing.TB, name string) string {
 	imageName, imageVersion := getFixtureImageInfo(t, name)
 	sifFileName := fmt.Sprintf("%s-%s.sif", imageName, imageVersion)
-	return getFixtureImageSIFPath(t, name, CacheDir, sifFileName)
+	return getFixtureImageSIFPath(t, name, getCacheDir(t), sifFileName)
 }
 
 func getFixtureImageSIFPath(t testing.TB, fixtureName, sifStoreDir, sifFileName string) string {
@@ -323,17 +384,17 @@ func getFixtureImageSIFPath(t testing.TB, fixtureName, sifStoreDir, sifFileName 
 	sifPath := path.Join(sifStoreDir, sifFileName)
 
 	// create the cache dir if it does not already exist...
-	if !dirExists(t, CacheDir) {
-		err := os.Mkdir(CacheDir, 0o755)
+	if !dirExists(t, getCacheDir(t)) {
+		err := os.MkdirAll(getCacheDir(t), 0o755)
 		if err != nil {
-			t.Fatalf("could not create sif cache dir (%s): %+v", CacheDir, err)
+			t.Fatalf("could not create sif cache dir (%s): %+v", getCacheDir(t), err)
 		}
 	}
 
 	// if the image sif does not exist, make it
 	if !fileExists(t, sifPath) {
 		if !isImageInDocker(fullImageName) {
-			contextPath := path.Join(testutils.TestFixturesDir, fixtureName)
+			contextPath := testutil.GetFixturePath(t, fixtureName)
 			buildDockerImage(t, contextPath, imageName, imageVersion)
 		}
 		err := buildSIFFromDocker(t, fullImageName, sifPath)

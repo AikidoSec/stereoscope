@@ -82,6 +82,10 @@ func (r RegistryOptions) Authenticator(registry string) authn.Authenticator {
 
 // TLSConfig selects the tls.Config object for handling TLS authentication with a registry.
 func (r RegistryOptions) TLSConfig(registry string) (*tls.Config, error) {
+	if r.InsecureSkipTLSVerify {
+		log.Debugf("TLS verification is disabled for registry %q", registry)
+	}
+
 	tlsOptions := r.tlsOptions(registry)
 
 	if tlsOptions == nil {
@@ -105,7 +109,7 @@ func (r RegistryOptions) TLSConfig(registry string) (*tls.Config, error) {
 		// load all the files in the directory as CA certs
 		rootCAs := tlsConfig.RootCAs
 		if rootCAs == nil {
-			rootCAs, err = tlsconfig.SystemCertPool()
+			rootCAs, err = x509.SystemCertPool()
 			if err != nil {
 				log.Warnf("unable to load system cert pool: %w", err)
 				rootCAs = x509.NewCertPool()
@@ -114,12 +118,15 @@ func (r RegistryOptions) TLSConfig(registry string) (*tls.Config, error) {
 
 		var files []string
 		if fi.IsDir() {
-			// glob all *.crt, *.pem, and *.cert files in the directory
-			var err error
-
-			files, err = doublestar.Glob(os.DirFS("."), filepath.Join(r.CAFileOrDir, "*.{crt,pem,cert}"))
+			// glob all *.crt, *.pem, and *.cert files within the dir itself. io/fs patterns are
+			// slash-separated and relative, so a host path (absolute, or with windows separators)
+			// never matches against os.DirFS(".")
+			matches, err := doublestar.Glob(os.DirFS(r.CAFileOrDir), "*.{crt,pem,cert}")
 			if err != nil {
 				return nil, fmt.Errorf("unable to find certs in %q: %w", r.CAFileOrDir, err)
+			}
+			for _, m := range matches {
+				files = append(files, filepath.Join(r.CAFileOrDir, m))
 			}
 		} else {
 			files = []string{r.CAFileOrDir}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -13,10 +14,10 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/docker/docker/pkg/homedir"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 
+	"github.com/anchore/go-homedir"
 	"github.com/anchore/stereoscope/internal/log"
 )
 
@@ -122,7 +123,8 @@ func getSSHCallback(params *sshClientConfig) ssh.HostKeyCallback {
 		return cb
 	}
 
-	knownHosts := filepath.Join(homedir.Get(), ".ssh", "known_hosts")
+	home, _ := homedir.Dir()
+	knownHosts := filepath.Join(home, ".ssh", "known_hosts")
 	key := hostKey(params.host, knownHosts)
 	if key != nil {
 		cb = ssh.FixedHostKey(key)
@@ -152,7 +154,6 @@ func httpClientOverSSH(params *sshClientConfig) (*http.Client, error) {
 			HostKeyCallback: getSSHCallback(params),
 			HostKeyAlgorithms: []string{
 				ssh.KeyAlgoRSA,
-				ssh.KeyAlgoDSA,
 				ssh.KeyAlgoECDSA256,
 				ssh.KeyAlgoSKECDSA256,
 				ssh.KeyAlgoECDSA384,
@@ -195,6 +196,7 @@ func hostKey(host, knownHostsPath string) ssh.PublicKey {
 		log.Errorf("openning known_hosts", err)
 		return nil
 	}
+	defer fd.Close()
 
 	// support -H parameter for ssh-keyscan
 	hashhost := knownhosts.HashHostname(host)
@@ -203,6 +205,12 @@ func hostKey(host, knownHostsPath string) ssh.PublicKey {
 	for scanner.Scan() {
 		_, hosts, key, _, _, err := ssh.ParseKnownHosts(scanner.Bytes())
 		if err != nil {
+			// ssh.ParseKnownHosts returns io.EOF for comment, blank, or
+			// whitespace-only lines. Those are valid in an OpenSSH
+			// known_hosts file, so skip them quietly instead of logging.
+			if errors.Is(err, io.EOF) {
+				continue
+			}
 			log.Errorf("Failed to parse known_hosts: %s", scanner.Text())
 			continue
 		}

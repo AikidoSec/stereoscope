@@ -1,6 +1,3 @@
-//go:build !windows
-// +build !windows
-
 package file
 
 import (
@@ -12,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -22,15 +20,8 @@ import (
 	"github.com/spf13/afero"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-)
 
-const (
-	fixturesPath = "test-fixtures"
-)
-
-var (
-	fixturesGeneratorsPath = path.Join(fixturesPath, "generators")
-	tarCachePath           = path.Join(fixturesPath, "tar-cache")
+	"github.com/anchore/stereoscope/internal/testutil"
 )
 
 func TestReaderFromTar_GoCase(t *testing.T) {
@@ -114,7 +105,13 @@ func TestMetadataFromTar(t *testing.T) {
 }
 
 func getTarFixture(t testing.TB, name string) *os.File {
+	if runtime.GOOS == "windows" {
+		// the generator scripts build the tar inside a linux container via bash
+		t.Skip("tar fixture generation requires bash and linux docker")
+	}
 	generatorScriptName := name + ".sh"
+	fixturesGeneratorsPath := testutil.GetFixturePath(t, "generators")
+	tarCachePath := testutil.GetFixturePath(t, "tar-cache")
 	generatorScriptPath := path.Join(fixturesGeneratorsPath, generatorScriptName)
 	if !fileExists(t, generatorScriptPath) {
 		t.Fatalf("no tar generator script for fixture '%s'", generatorScriptPath)
@@ -213,6 +210,8 @@ func Test_tarVisitor_visit(t *testing.T) {
 			haveDirs := strset.New()
 			err := afero.Walk(fs, "/", func(path string, info os.FileInfo, err error) error {
 				require.NoError(t, err)
+				// walk yields host separators, expectations are slash paths
+				path = filepath.ToSlash(path)
 				if info.IsDir() {
 					haveDirs.Add(path)
 				} else {
@@ -413,7 +412,7 @@ func Test_tarVisitor_visit(t *testing.T) {
 				tt.wantErr = require.NoError
 			}
 			v := tarVisitor{
-				fs:          afero.NewMemMapFs(),
+				fs:          afero.NewBasePathFs(afero.NewOsFs(), t.TempDir()),
 				destination: "/tmp",
 			}
 			err := v.visit(tt.entry)
@@ -429,4 +428,32 @@ func Test_tarVisitor_visit(t *testing.T) {
 			assertNoFilesInRoot(t, v.fs)
 		})
 	}
+}
+
+func Test_tarVisitor_visit_missingParentDirs(t *testing.T) {
+	// use a real filesystem to ensure MkdirAll works correctly
+	// (MemMapFs may behave differently than OS filesystem)
+	v := tarVisitor{
+		fs:          afero.NewBasePathFs(afero.NewOsFs(), t.TempDir()),
+		destination: "",
+	}
+
+	entry := TarFileEntry{
+		Sequence: 0,
+		Header: tar.Header{
+			Typeflag: tar.TypeReg,
+			Name:     "/blobs/sha256/somefile.txt",
+			Linkname: "",
+			Size:     7,
+			Mode:     0644,
+		},
+		Reader: strings.NewReader("content"),
+	}
+
+	require.NoError(t, v.visit(entry))
+
+	// verify the file was created with correct content
+	content, err := afero.ReadFile(v.fs, filepath.Join("blobs", "sha256", "somefile.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, "content", string(content))
 }

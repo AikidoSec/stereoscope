@@ -14,12 +14,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containerd/errdefs"
 	"github.com/docker/cli/cli/config"
 	configTypes "github.com/docker/cli/cli/config/types"
-	"github.com/docker/docker/api/types"
-	dockerImage "github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/client"
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/moby/moby/client"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/wagoodman/go-partybus"
 	"github.com/wagoodman/go-progress"
 
@@ -66,31 +66,71 @@ func (p *daemonImageProvider) Name() string {
 	return p.name
 }
 
+// ociPlatform converts the stereoscope platform to an OCI platform spec, for use with Docker API options.
+func (p *daemonImageProvider) ociPlatform() *ocispec.Platform {
+	if p.platform == nil {
+		return nil
+	}
+	return &ocispec.Platform{
+		OS:           p.platform.OS,
+		Architecture: p.platform.Architecture,
+		Variant:      p.platform.Variant,
+	}
+}
+
+// platformInspect calls ImageInspect with platform selection when a platform is configured.
+// Docker 29+ stores multi-platform images as manifest lists; without the platform parameter,
+// inspect returns empty OS/Architecture fields for foreign-platform images. This method
+// passes the platform to the API (available since API v1.49) and falls back to a plain
+// inspect for older daemons.
+func (p *daemonImageProvider) platformInspect(ctx context.Context, apiClient client.APIClient, imageRef string) (client.ImageInspectResult, error) {
+	if p.platform != nil {
+		result, err := apiClient.ImageInspect(ctx, imageRef, client.ImageInspectWithPlatform(p.ociPlatform()))
+		if err == nil {
+			return result, nil
+		}
+		// if the daemon doesn't support the platform option (older API), fall back to a plain inspect
+		log.Debugf("platform-aware inspect failed, falling back to plain inspect: %v", err)
+	}
+	return apiClient.ImageInspect(ctx, imageRef)
+}
+
+// platformSave calls ImageSave with platform selection when a platform is configured.
+// Docker 29+ stores multi-platform images as manifest lists; without the platform parameter,
+// save may fail or return the wrong platform. This method passes the platform to the API
+// (available since API v1.48) and falls back to a plain save for older daemons.
+func (p *daemonImageProvider) platformSave(ctx context.Context, apiClient client.APIClient, imageRef string) (io.ReadCloser, error) {
+	if p.platform != nil {
+		result, err := apiClient.ImageSave(ctx, []string{imageRef}, client.ImageSaveWithPlatforms(*p.ociPlatform()))
+		if err == nil {
+			return result, nil
+		}
+		// if the daemon doesn't support the platform option (older API), fall back to a plain save
+		log.Debugf("platform-aware save failed, falling back to plain save: %v", err)
+	}
+	return apiClient.ImageSave(ctx, []string{imageRef})
+}
+
 type daemonProvideProgress struct {
 	SaveProgress *progress.TimedProgress
 	CopyProgress *progress.Writer
 	Stage        *progress.AtomicStage
 }
 
-//nolint:staticcheck
 func (p *daemonImageProvider) trackSaveProgress(ctx context.Context, apiClient client.APIClient, imageRef string) (*daemonProvideProgress, error) {
 	// fetch the expected image size to estimate and measure progress
-	inspect, _, err := apiClient.ImageInspectWithRaw(ctx, imageRef)
+	inspect, err := p.platformInspect(ctx, apiClient, imageRef)
 	if err != nil {
 		return nil, fmt.Errorf("unable to inspect image: %w", err)
 	}
 
 	// docker image save clocks in at ~125MB/sec on my laptop... mileage may vary, of course :shrug:
 	mb := math.Pow(2, 20)
-	// "virtual size" is the total amount of disk-space used for the read-only image
-	// data used by the container and the writable layer.
-	// "size" (also provider by the inspect result) shows the amount of data (on disk)
-	// that is used for the writable layer of each container.
-	sec := float64(inspect.VirtualSize) / (mb * 125)
+	sec := float64(inspect.Size) / (mb * 125)
 	approxSaveTime := time.Duration(sec*1000) * time.Millisecond
 
 	estimateSaveProgress := progress.NewTimedProgress(approxSaveTime)
-	copyProgress := progress.NewSizedWriter(inspect.VirtualSize)
+	copyProgress := progress.NewSizedWriter(inspect.Size)
 	aggregateProgress := progress.NewAggregator(progress.NormalizeStrategy, estimateSaveProgress, copyProgress)
 
 	// let consumers know of a monitorable event (image save + copy stages)
@@ -140,6 +180,7 @@ func (p *daemonImageProvider) pull(ctx context.Context, client client.APIClient,
 	if err != nil {
 		return fmt.Errorf("pull failed: %w", err)
 	}
+	defer resp.Close()
 
 	var thePullEvent *pullEvent
 	decoder := json.NewDecoder(resp)
@@ -183,9 +224,14 @@ func handlePullEvent(status emitter, event *pullEvent) error {
 	return nil
 }
 
-func (p *daemonImageProvider) pullOptions(imageRef string) (dockerImage.PullOptions, error) {
-	options := dockerImage.PullOptions{
-		Platform: p.platform.String(),
+func (p *daemonImageProvider) pullOptions(imageRef string) (client.ImagePullOptions, error) {
+	options := client.ImagePullOptions{}
+	if p.platform != nil {
+		options.Platforms = append(options.Platforms, ocispec.Platform{
+			Architecture: p.platform.Architecture,
+			OS:           p.platform.OS,
+			Variant:      p.platform.Variant,
+		})
 	}
 
 	// note: this will search the default config dir and allow for a DOCKER_CONFIG override
@@ -257,6 +303,7 @@ func authURL(imageRef string, dockerhubWorkaround bool) (string, error) {
 
 // Provide an image object that represents the cached docker image tar fetched from a docker daemon.
 func (p *daemonImageProvider) Provide(ctx context.Context) (*image.Image, error) {
+	startTime := time.Now()
 	apiClient, err := p.newAPIClient()
 	if err != nil {
 		return nil, fmt.Errorf("%s not available: %w", p.name, err)
@@ -271,18 +318,23 @@ func (p *daemonImageProvider) Provide(ctx context.Context) (*image.Image, error)
 	c2, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	pong, err := apiClient.Ping(c2)
+	pong, err := apiClient.Ping(c2, client.PingOptions{})
 	if err != nil || pong.APIVersion == "" {
 		return nil, fmt.Errorf("unable to get %s API response: %w", p.name, err)
 	}
 
+	log.WithFields("image", p.imageStr).Info("docker pulling image")
 	imageRef, err := p.pullImageIfMissing(ctx, apiClient)
 	if err != nil {
 		return nil, err
 	}
 
-	// inspect the image that might have been pulled
-	inspectResult, _, err := apiClient.ImageInspectWithRaw(ctx, imageRef)
+	log.WithFields("image", imageRef, "time", time.Since(startTime)).Info("docker pulled image")
+	startTime = time.Now()
+
+	// inspect the image that might have been pulled, using platform-aware inspect to resolve
+	// the correct platform variant in Docker 29+ multi-platform image stores
+	inspectResult, err := p.platformInspect(ctx, apiClient, imageRef)
 	if err != nil {
 		return nil, fmt.Errorf("unable to inspect existing image: %w", err)
 	}
@@ -292,10 +344,15 @@ func (p *daemonImageProvider) Provide(ctx context.Context) (*image.Image, error)
 		return nil, err
 	}
 
+	log.WithFields("image", imageRef, "time", time.Since(startTime)).Trace("docker validated image")
+	startTime = time.Now()
+
 	tarFileName, err := p.saveImage(ctx, apiClient, imageRef)
 	if err != nil {
 		return nil, err
 	}
+
+	log.WithFields("image", imageRef, "time", time.Since(startTime), "path", tarFileName).Info("docker saved image")
 
 	// use the existing tarball provider to process what was pulled from the docker daemon
 	return NewArchiveProvider(p.tmpDirGen, tarFileName, withInspectMetadata(inspectResult)...).
@@ -333,7 +390,7 @@ func (p *daemonImageProvider) saveImage(ctx context.Context, apiClient client.AP
 	}()
 
 	providerProgress.Stage.Set(fmt.Sprintf("requesting image from %s", p.name))
-	readCloser, err := apiClient.ImageSave(ctx, []string{imageRef})
+	readCloser, err := p.platformSave(ctx, apiClient, imageRef)
 	if err != nil {
 		return "", fmt.Errorf("unable to save image tar: %w", err)
 	}
@@ -370,16 +427,17 @@ func (p *daemonImageProvider) pullImageIfMissing(ctx context.Context, apiClient 
 		return "", err
 	}
 
-	// check if the image exists locally
-	inspectResult, _, err := apiClient.ImageInspectWithRaw(ctx, imageRef)
+	// check if the image exists locally (use platform-aware inspect so Docker 29+ resolves
+	// the correct platform variant from a multi-platform manifest list)
+	inspectResult, err := p.platformInspect(ctx, apiClient, imageRef)
 	if err != nil {
-		inspectResult, _, err = apiClient.ImageInspectWithRaw(ctx, originalImageRef)
+		inspectResult, err = p.platformInspect(ctx, apiClient, originalImageRef)
 		if err == nil {
 			imageRef = strings.TrimSuffix(imageRef, ":latest")
 		}
 	}
 	if err != nil {
-		if client.IsErrNotFound(err) {
+		if errdefs.IsNotFound(err) {
 			if err = p.pull(ctx, apiClient, imageRef); err != nil {
 				return imageRef, err
 			}
@@ -398,7 +456,7 @@ func (p *daemonImageProvider) pullImageIfMissing(ctx context.Context, apiClient 
 	return imageRef, nil
 }
 
-func (p *daemonImageProvider) validatePlatform(i types.ImageInspect) error {
+func (p *daemonImageProvider) validatePlatform(i client.ImageInspectResult) error {
 	if p.platform == nil {
 		// the user did not specify a platform
 		return nil
@@ -417,7 +475,7 @@ func (p *daemonImageProvider) validatePlatform(i types.ImageInspect) error {
 	return nil
 }
 
-func withInspectMetadata(i types.ImageInspect) (metadata []image.AdditionalMetadata) {
+func withInspectMetadata(i client.ImageInspectResult) (metadata []image.AdditionalMetadata) {
 	metadata = append(metadata,
 		image.WithTags(i.RepoTags...),
 		image.WithRepoDigests(i.RepoDigests...),
@@ -433,6 +491,7 @@ func encodeCredentials(authConfig configTypes.AuthConfig) (string, error) {
 	// note: the contents may contain characters that should not be escaped (such as password contents)
 	encoder.SetEscapeHTML(false)
 
+	//nolint:gosec // G117: encoding auth config with password is required for Docker registry authentication
 	if err := encoder.Encode(authConfig); err != nil {
 		return "", err
 	}

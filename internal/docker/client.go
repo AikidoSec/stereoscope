@@ -9,38 +9,31 @@ import (
 	"strings"
 
 	"github.com/docker/cli/cli/connhelper"
-	"github.com/docker/docker/client"
-	"github.com/mitchellh/go-homedir"
+	"github.com/moby/moby/client"
+
+	"github.com/anchore/go-homedir"
 )
 
 func GetClient() (*client.Client, error) {
 	var clientOpts = []client.Opt{
 		client.FromEnv,
-		client.WithAPIVersionNegotiation(),
 	}
 
 	host := os.Getenv("DOCKER_HOST")
 	if strings.HasPrefix(host, "ssh") {
-		var (
-			helper *connhelper.ConnectionHelper
-			err    error
-		)
-
-		helper, err = connhelper.GetConnectionHelper(host)
-
+		helper, err := connhelper.GetConnectionHelper(host)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch docker connection helper: %w", err)
 		}
-		clientOpts = append(clientOpts, func(c *client.Client) error {
-			httpClient := &http.Client{
+		clientOpts = append(clientOpts,
+			client.WithHTTPClient(&http.Client{
 				Transport: &http.Transport{
 					DialContext: helper.Dialer,
 				},
-			}
-			return client.WithHTTPClient(httpClient)(c)
-		})
-		clientOpts = append(clientOpts, client.WithHost(helper.Host))
-		clientOpts = append(clientOpts, client.WithDialContext(helper.Dialer))
+			}),
+			client.WithHost(helper.Host),
+			client.WithDialContext(helper.Dialer),
+		)
 	}
 
 	if os.Getenv("DOCKER_TLS_VERIFY") != "" && os.Getenv("DOCKER_CERT_PATH") == "" {
@@ -67,7 +60,7 @@ func GetClient() (*client.Client, error) {
 
 func checkConnection(dockerClient *client.Client) error {
 	ctx := context.Background()
-	_, err := dockerClient.Ping(ctx)
+	_, err := dockerClient.Ping(ctx, client.PingOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to ping Docker daemon: %w", err)
 	}
@@ -75,11 +68,10 @@ func checkConnection(dockerClient *client.Client) error {
 }
 
 func newClient(socket string, opts ...client.Opt) (*client.Client, error) {
-	if socket == "" {
-		return client.NewClientWithOpts(opts...)
+	if socket != "" {
+		opts = append(opts, client.WithHost(socket))
 	}
-	opts = append(opts, client.WithHost(socket))
-	return client.NewClientWithOpts(opts...)
+	return client.New(opts...)
 }
 
 func possibleSocketPaths(os string) []string {

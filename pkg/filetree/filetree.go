@@ -11,6 +11,7 @@ import (
 	"github.com/scylladb/go-set/iset"
 	"github.com/scylladb/go-set/strset"
 
+	"github.com/anchore/stereoscope/internal/log"
 	"github.com/anchore/stereoscope/pkg/file"
 	"github.com/anchore/stereoscope/pkg/filetree/filenode"
 	"github.com/anchore/stereoscope/pkg/tree"
@@ -22,12 +23,22 @@ var ErrLinkCycleDetected = errors.New("cycle during symlink resolution")
 var ErrLinkResolutionDepth = errors.New("maximum link resolution stack depth exceeded")
 var maxLinkResolutionDepth = 100
 
+// IsUnresolvableLink indicates a link that cannot be followed because the image itself is malformed, as
+// opposed to a lookup that legitimately failed. Callers enumerating the tree should treat these paths as
+// unresolved and keep going; callers resolving or mutating one specific path still want the error.
+// This is exported so that callers wrapping the single-path resolution API (which still returns these
+// errors) can make the same distinction without restating which sentinels mean "malformed image".
+func IsUnresolvableLink(err error) bool {
+	return errors.Is(err, ErrLinkCycleDetected) || errors.Is(err, ErrLinkResolutionDepth)
+}
+
 // FileTree represents a file/directory Tree
 type FileTree struct {
 	tree *tree.Tree
 }
 
 // NewFileTree creates a new FileTree instance.
+//
 // Deprecated: use New() instead.
 func NewFileTree() *FileTree {
 	return New()
@@ -89,6 +100,10 @@ func (t *FileTree) ListPaths(dir file.Path) ([]file.Path, error) {
 		FollowAncestorLinks: true,
 		FollowBasenameLinks: true,
 	})
+	if IsUnresolvableLink(err) {
+		log.WithFields("path", dir, "error", err).Trace("skipping path with malformed link while listing")
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -325,7 +340,6 @@ func (t *FileTree) resolveAncestorLinks(path file.Path, currentlyResolvingLinkPa
 
 // resolveNodeLinks takes the given FileNode and resolves all links at the base of the real path for the node (this implies
 // that NO ancestors are considered).
-// nolint: funlen
 func (t *FileTree) resolveNodeLinks(n *nodeAccess, followDeadBasenameLinks bool, currentlyResolvingLinkPaths file.PathCountSet, maxLinkDepth int) (*nodeAccess, error) {
 	if n == nil {
 		return nil, fmt.Errorf("cannot resolve links with nil Node given")
@@ -465,6 +479,10 @@ func (t *FileTree) FilesByGlob(query string, options ...LinkResolutionOption) ([
 			FollowBasenameLinks:          true,
 			DoNotFollowDeadBasenameLinks: doNotFollowDeadBasenameLinks,
 		})
+		if IsUnresolvableLink(err) {
+			log.WithFields("path", matchPath, "error", err).Trace("skipping glob match with malformed link")
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -554,7 +572,7 @@ func (t *FileTree) AddHardLink(realPath file.Path, linkPath file.Path) (*file.Re
 	if fna.HasFileNode() {
 		// this path already exists
 		if fna.FileNode.FileType != file.TypeHardLink {
-			return nil, fmt.Errorf("path=%q already exists but is NOT a symlink file", realPath)
+			return nil, fmt.Errorf("path=%q already exists but is NOT a hardlink file", realPath)
 		}
 		// this is a symlink file, provide a new or existing file.Reference
 		if fna.FileNode.Reference == nil {
@@ -585,7 +603,7 @@ func (t *FileTree) AddDir(realPath file.Path) (*file.Reference, error) {
 	if fna.HasFileNode() {
 		// this path already exists
 		if fna.FileNode.FileType != file.TypeDirectory {
-			return nil, fmt.Errorf("path=%q already exists but is NOT a symlink file", realPath)
+			return nil, fmt.Errorf("path=%q already exists but is NOT a directory", realPath)
 		}
 		// this is a directory, provide a new or existing file.Reference
 		if fna.FileNode.Reference == nil {
@@ -702,10 +720,16 @@ func (t *FileTree) RemovePath(path file.Path) error {
 // basename is a symlink, then the symlink is followed before resolving children. If the path does not exist, this is a
 // nop.
 func (t *FileTree) RemoveChildPaths(path file.Path) error {
-	fna, err := t.node(path, linkResolutionStrategy{
+	return t.removeChildPaths(path, linkResolutionStrategy{
 		FollowAncestorLinks: true,
 		FollowBasenameLinks: true,
 	})
+}
+
+// removeChildPaths deletes the children of the node the strategy resolves path to. A zero strategy
+// means the literal real path.
+func (t *FileTree) removeChildPaths(path file.Path, strategy linkResolutionStrategy) error {
+	fna, err := t.node(path, strategy)
 	if err != nil {
 		return err
 	}
@@ -782,8 +806,6 @@ func (t *FileTree) Walk(fn func(path file.Path, f filenode.FileNode) error, cond
 // Merge takes the given Tree and combines it with the current Tree, preferring files in the other Tree if there
 // are path conflicts. This is the basis function for squashing (where the current Tree is the bottom Tree and the
 // given Tree is the top Tree).
-//
-//nolint:gocognit,funlen
 func (t *FileTree) Merge(upper Reader) error {
 	conditions := tree.WalkConditions{
 		ShouldContinueBranch: func(n node.Node) bool {
@@ -803,8 +825,10 @@ func (t *FileTree) Merge(upper Reader) error {
 		upperNode := n.(*filenode.FileNode)
 		// opaque directories must be processed first
 		if hasOpaqueDirectory(upper, upperNode.RealPath) {
-			err := t.RemoveChildPaths(upperNode.RealPath)
-			if err != nil {
+			// clear by real path, never through a link. An overlay mount masks a lower symlink instead of
+			// merging into its target, so resolving here would delete files still visible at the target.
+			// Note containerd and umoci resolve the marker's parent instead.
+			if err := t.removeChildPaths(upperNode.RealPath, linkResolutionStrategy{}); err != nil {
 				return fmt.Errorf("filetree Merge failed to remove child paths (upperPath=%s): %w", upperNode.RealPath, err)
 			}
 		}
@@ -816,6 +840,12 @@ func (t *FileTree) Merge(upper Reader) error {
 			}
 
 			err = t.RemovePath(lowerPath)
+			// a malformed link must not fail the whole squash. RemovePath does not follow the basename, so
+			// its real path lookup already missed before resolution failed: there is no node to delete.
+			if IsUnresolvableLink(err) {
+				log.WithFields("path", lowerPath, "error", err).Trace("whiteout over malformed link during merge, nothing to remove")
+				err = nil
+			}
 			if err != nil {
 				return fmt.Errorf("filetree Merge failed to remove upperPath (upperPath=%s): %w", lowerPath, err)
 			}
@@ -846,7 +876,8 @@ func (t *FileTree) Merge(upper Reader) error {
 
 		if lowerNode.HasFileNode() && upperNode.FileType != file.TypeDirectory && lowerNode.FileNode.FileType == file.TypeDirectory {
 			// NOTE: both upperNode and lowerNode paths are the same, and does not have an effect
-			// on removal of child paths
+			// on removal of child paths. No link is followed: lowerNode was found at the literal real
+			// path and the condition above proves it is a directory.
 			err := t.RemoveChildPaths(upperNode.RealPath)
 			if err != nil {
 				return fmt.Errorf("filetree Merge failed to remove children for non-directory upper node (%s): %w", upperNode.RealPath, err)

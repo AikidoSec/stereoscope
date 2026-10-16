@@ -3,22 +3,72 @@ package oci
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
-	"runtime"
+	"os"
+	"sync"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
-	containerregistryV1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	containerregistryV1Types "github.com/google/go-containerregistry/pkg/v1/types"
 
+	async "github.com/anchore/go-sync"
 	"github.com/anchore/stereoscope/internal/log"
 	"github.com/anchore/stereoscope/pkg/file"
 	"github.com/anchore/stereoscope/pkg/image"
 )
 
 const Registry image.Source = image.OciRegistrySource
+
+// effectiveURLTransport is a custom transport that captures the effective URL after following redirects
+type effectiveURLTransport struct {
+	base          http.RoundTripper
+	effectiveURLs map[string]string // maps original host to effective host
+	mutex         sync.RWMutex
+}
+
+func newEffectiveURLTransport(base http.RoundTripper) *effectiveURLTransport {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return &effectiveURLTransport{
+		base:          base,
+		effectiveURLs: make(map[string]string),
+	}
+}
+
+func (t *effectiveURLTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	originalHost := req.URL.Host
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return resp, err
+	}
+
+	// Check if the effective URL is different from the original
+	if resp.Request != nil && resp.Request.URL != nil {
+		effectiveHost := resp.Request.URL.Host
+		if effectiveHost != originalHost {
+			t.mutex.Lock()
+			t.effectiveURLs[originalHost] = effectiveHost
+			t.mutex.Unlock()
+			log.Debugf("captured effective URL after redirect: %s -> %s", originalHost, effectiveHost)
+		}
+	}
+
+	return resp, err
+}
+
+func (t *effectiveURLTransport) getEffectiveHost(originalHost string) string {
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+	if effectiveHost, exists := t.effectiveURLs[originalHost]; exists {
+		return effectiveHost
+	}
+	return originalHost
+}
 
 // NewRegistryProvider creates a new provider instance for a specific image that will later be cached to the given directory.
 func NewRegistryProvider(tmpDirGen *file.TempDirGenerator, registryOptions image.RegistryOptions, imageStr string, platform *image.Platform) image.Provider {
@@ -32,10 +82,11 @@ func NewRegistryProvider(tmpDirGen *file.TempDirGenerator, registryOptions image
 
 // registryImageProvider is an image.Provider capable of fetching and representing a container image fetched from a remote registry (described by the OCI distribution spec).
 type registryImageProvider struct {
-	tmpDirGen       *file.TempDirGenerator
-	imageStr        string
-	platform        *image.Platform
-	registryOptions image.RegistryOptions
+	tmpDirGen          *file.TempDirGenerator
+	imageStr           string
+	platform           *image.Platform
+	registryOptions    image.RegistryOptions
+	effectiveTransport *effectiveURLTransport
 }
 
 func (p *registryImageProvider) Name() string {
@@ -46,6 +97,7 @@ func (p *registryImageProvider) Name() string {
 func (p *registryImageProvider) Provide(ctx context.Context) (*image.Image, error) {
 	log.Debugf("pulling image info directly from registry image=%q", p.imageStr)
 
+	startTime := time.Now()
 	imageTempDir, err := p.tmpDirGen.NewDirectory("oci-registry-image")
 	if err != nil {
 		return nil, err
@@ -58,7 +110,12 @@ func (p *registryImageProvider) Provide(ctx context.Context) (*image.Image, erro
 
 	platform := defaultPlatformIfNil(p.platform)
 
-	options := prepareRemoteOptions(ctx, ref, p.registryOptions, platform)
+	// Initialize the effective URL transport if not already done
+	if p.effectiveTransport == nil {
+		p.effectiveTransport = newEffectiveURLTransport(nil)
+	}
+
+	options := prepareRemoteOptions(ctx, ref, p.registryOptions, platform, p.effectiveTransport)
 
 	descriptor, err := remote.Get(ref, options...)
 	if err != nil {
@@ -77,13 +134,18 @@ func (p *registryImageProvider) Provide(ctx context.Context) (*image.Image, erro
 		return nil, fmt.Errorf("failed to get image config from registry: %+v", err)
 	}
 
-	if err := validatePlatform(platform, c.OS, c.Architecture); err != nil {
+	if err := validatePlatform(platform, c.OS, c.Architecture, c.Variant); err != nil {
 		return nil, err
 	}
 
+	log.WithFields("image", p.imageStr, "time", time.Since(startTime)).Info("completed downloading manifest")
+
 	// craft a repo digest from the registry reference and the known digest
 	// note: the descriptor is fetched from the registry, and the descriptor digest is the same as the repo digest
-	repoDigest := fmt.Sprintf("%s/%s@%s", ref.Context().RegistryStr(), ref.Context().RepositoryStr(), descriptor.Digest.String())
+	// Use the effective registry host if it differs from the original due to redirects
+	originalRegistry := ref.Context().RegistryStr()
+	effectiveRegistry := p.effectiveTransport.getEffectiveHost(originalRegistry)
+	repoDigest := fmt.Sprintf("%s/%s@%s", effectiveRegistry, ref.Context().RepositoryStr(), descriptor.Digest.String())
 
 	metadata := []image.AdditionalMetadata{
 		image.WithRepoDigests(repoDigest),
@@ -101,10 +163,19 @@ func (p *registryImageProvider) Provide(ctx context.Context) (*image.Image, erro
 		)
 	}
 
+	// registry layers arrive over the network: download them one at a time, since a second stream
+	// only splits a link a single stream already saturates, while already-fetched layers are
+	// indexed in parallel at the default bound. A caller that installed its own fetch executor
+	// knows better than we do, so leave theirs alone.
+	if !async.HasContextExecutor(ctx, image.LayerFetchExecutor) {
+		ctx = async.SetContextExecutor(ctx, image.LayerFetchExecutor, async.NewExecutor(1))
+	}
+
 	out := image.New(img, p.tmpDirGen, imageTempDir, metadata...)
-	err = out.Read()
+	err = out.Read(ctx)
 	if err != nil {
-		return nil, err
+		cleanErr := out.Cleanup()
+		return nil, errors.Join(err, cleanErr)
 	}
 	return out, err
 }
@@ -125,55 +196,21 @@ func (p *registryImageProvider) finalizePlatform(descriptor *remote.Descriptor, 
 	}
 }
 
-func validatePlatform(platform *image.Platform, givenOs, givenArch string) error {
-	if platform == nil {
-		return nil
-	}
-	if givenArch == "" || givenOs == "" {
-		return newErrPlatformMismatch(platform, fmt.Errorf("missing architecture or OS from image config when user specified platform=%q", platform.String()))
-	}
-	platformStr := fmt.Sprintf("%s/%s", givenOs, givenArch)
-	actualPlatform, err := containerregistryV1.ParsePlatform(platformStr)
-	if err != nil {
-		return newErrPlatformMismatch(platform, fmt.Errorf("failed to parse platform from image config: %w", err))
-	}
-	if actualPlatform == nil {
-		return newErrPlatformMismatch(platform, fmt.Errorf("not platform from image config (from %q)", platformStr))
-	}
-	if !matchesPlatform(*actualPlatform, *toContainerRegistryPlatform(platform)) {
-		return newErrPlatformMismatch(platform, fmt.Errorf("image platform=%q does not match user specified platform=%q", actualPlatform.String(), platform.String()))
-	}
-	return nil
-}
-
-func newErrPlatformMismatch(platform *image.Platform, err error) *image.ErrPlatformMismatch {
-	return &image.ErrPlatformMismatch{
-		ExpectedPlatform: platform.String(),
-		Err:              err,
-	}
-}
-
 func prepareReferenceOptions(registryOptions image.RegistryOptions) []name.Option {
 	var options []name.Option
 	if registryOptions.InsecureUseHTTP {
+		log.Debug("HTTP transport is enabled for registry communication")
 		options = append(options, name.Insecure)
 	}
 	return options
 }
 
-func toContainerRegistryPlatform(p *image.Platform) *containerregistryV1.Platform {
-	if p == nil {
-		return nil
-	}
-	return &containerregistryV1.Platform{
-		Architecture: p.Architecture,
-		OS:           p.OS,
-		Variant:      p.Variant,
-	}
-}
-
-func prepareRemoteOptions(ctx context.Context, ref name.Reference, registryOptions image.RegistryOptions, p *image.Platform) (options []remote.Option) {
+func prepareRemoteOptions(ctx context.Context, ref name.Reference, registryOptions image.RegistryOptions, p *image.Platform, effectiveTransport *effectiveURLTransport) (options []remote.Option) {
 	options = append(options, remote.WithContext(ctx))
+
+	// Set the user agent to indicate what binary is making the request
+	// (e.g. syft, grype)
+	options = append(options, remote.WithUserAgent(os.Args[0]))
 
 	if p != nil {
 		options = append(options, remote.WithPlatform(*toContainerRegistryPlatform(p)))
@@ -200,9 +237,11 @@ func prepareRemoteOptions(ctx context.Context, ref name.Reference, registryOptio
 	tlsConfig, err := registryOptions.TLSConfig(registryName)
 	if err != nil {
 		log.Warn("unable to configure TLS transport: %w", err)
-	} else if tlsConfig != nil {
-		options = append(options, remote.WithTransport(getTransport(tlsConfig)))
 	}
+
+	// Use our custom transport that captures effective URLs after redirects
+	transport := getTransportWithEffectiveURL(tlsConfig, effectiveTransport)
+	options = append(options, remote.WithTransport(transport))
 
 	return options
 }
@@ -214,66 +253,11 @@ func getTransport(tlsConfig *tls.Config) *http.Transport {
 	return transport
 }
 
-// defaultPlatformIfNil sets the platform to use the host's architecture
-// if no platform was specified. The OCI registry NewProvider uses "linux/amd64"
-// as a hard-coded default platform, which has surprised customers
-// running stereoscope on non-amd64 hosts. If platform is already
-// set on the config, or the code can't generate a matching platform,
-// do nothing.
-func defaultPlatformIfNil(platform *image.Platform) *image.Platform {
-	if platform == nil {
-		p, err := image.NewPlatform(fmt.Sprintf("linux/%s", runtime.GOARCH))
-		if err == nil {
-			return p
-		}
-	}
-	return platform
-}
+func getTransportWithEffectiveURL(tlsConfig *tls.Config, effectiveTransport *effectiveURLTransport) http.RoundTripper {
+	// create base transport with TLS config
+	baseTransport := getTransport(tlsConfig)
 
-// matchesPlatform checks if the given platform matches the required platforms.
-// The given platform matches the required platform if
-// - architecture and OS are identical.
-// - OS version and variant are identical if provided.
-// - features and OS features of the required platform are subsets of those of the given platform.
-// note: this function was copied from the GGCR repo, as it is not exported.
-func matchesPlatform(given, required containerregistryV1.Platform) bool {
-	// Required fields that must be identical.
-	if given.Architecture != required.Architecture || given.OS != required.OS {
-		return false
-	}
-
-	// Optional fields that may be empty, but must be identical if provided.
-	if required.OSVersion != "" && given.OSVersion != required.OSVersion {
-		return false
-	}
-	if required.Variant != "" && given.Variant != required.Variant {
-		return false
-	}
-
-	// Verify required platform's features are a subset of given platform's features.
-	if !isSubset(given.OSFeatures, required.OSFeatures) {
-		return false
-	}
-	if !isSubset(given.Features, required.Features) {
-		return false
-	}
-
-	return true
-}
-
-// isSubset checks if the required array of strings is a subset of the given lst.
-// note: this function was copied from the GGCR repo, as it is not exported.
-func isSubset(lst, required []string) bool {
-	set := make(map[string]bool)
-	for _, value := range lst {
-		set[value] = true
-	}
-
-	for _, value := range required {
-		if _, ok := set[value]; !ok {
-			return false
-		}
-	}
-
-	return true
+	// wrap it with our effective URL capturing transport
+	effectiveTransport.base = baseTransport
+	return effectiveTransport
 }

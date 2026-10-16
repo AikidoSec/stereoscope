@@ -1,14 +1,27 @@
 package image
 
 import (
+	"archive/tar"
+	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	v1Types "github.com/google/go-containerregistry/pkg/v1/types"
+	"github.com/stretchr/testify/require"
+
+	"github.com/anchore/stereoscope/internal/testutil"
+	"github.com/anchore/stereoscope/pkg/file"
+	"github.com/anchore/stereoscope/pkg/filetree"
 )
 
 func TestImageAdditionalMetadata(t *testing.T) {
@@ -90,17 +103,9 @@ func TestImageAdditionalMetadata(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			tempFile, err := os.CreateTemp("", "")
-			if err != nil {
-				t.Fatalf("could not create tempfile: %+v", err)
-			}
-			t.Cleanup(func() {
-				os.Remove(tempFile.Name())
-			})
+			img := New(nil, nil, t.TempDir(), test.options...)
 
-			img := New(nil, nil, tempFile.Name(), test.options...)
-
-			err = img.applyOverrideMetadata()
+			err := img.applyOverrideMetadata()
 			if err != nil {
 				t.Fatalf("could not create image: %+v", err)
 			}
@@ -134,4 +139,237 @@ func TestImage_SquashedTree(t *testing.T) {
 			t.Error("expected an initialized, empty FileTree, but got a nil FileTree")
 		}
 	})
+}
+
+// failingLayer is a valid layer right up until its content is needed, so Image.Read fails partway
+// through the layer loop rather than in the up-front media type validation.
+type failingLayer struct{ mockLayer }
+
+func (failingLayer) Uncompressed() (io.ReadCloser, error) {
+	return nil, errors.New("layer content unavailable")
+}
+
+func (failingLayer) MediaType() (v1Types.MediaType, error) {
+	return v1Types.DockerLayer, nil
+}
+
+func TestImage_CleanupReleasesLayerTars(t *testing.T) {
+	img := readImageFromLayers(t, layerFromTarEntries(t, tarEntry{path: "a.txt", contents: "alpha"}))
+
+	rc, err := img.OpenPathFromSquash("/a.txt")
+	require.NoError(t, err)
+	contents, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.Equal(t, "alpha", string(contents))
+	require.NoError(t, rc.Close())
+
+	require.NoError(t, img.Cleanup())
+
+	rc, err = img.OpenPathFromSquash("/a.txt")
+	require.NoError(t, err)
+	_, err = io.ReadAll(rc)
+	require.ErrorIs(t, err, os.ErrClosed, "cleanup did not release the layer tar")
+
+	// readImageFromLayers registers a second Cleanup via t.Cleanup, so this must stay idempotent
+	require.NoError(t, img.Cleanup())
+}
+
+func TestImage_SecondReadReleasesTheFirstReadsTars(t *testing.T) {
+	img := readImageFromLayers(t, layerFromTarEntries(t, tarEntry{path: "a.txt", contents: "alpha"}))
+
+	// Read() looks idempotent and is called twice in the wild: pkg/image/sif/archive_provider_test.go
+	// and test/integration/oci_registry_source_test.go both re-read an already-read image
+	firstIndex := img.Layers[0].indexedContent
+	require.NoError(t, img.Read(context.Background()))
+	require.NotSame(t, firstIndex, img.Layers[0].indexedContent, "second Read builds a fresh index")
+
+	// the second Read replaced the first one's layers, so it had to release them on the way past:
+	// nothing else can still reach that index
+	entries, err := firstIndex.EntriesByName("a.txt")
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	_, err = io.ReadAll(entries[0].Reader)
+	require.ErrorIs(t, err, os.ErrClosed, "the first Read's layer tar was orphaned")
+}
+
+func TestImage_PartialReadReleasesEarlierLayers(t *testing.T) {
+	v1Img, err := mutate.AppendLayers(empty.Image,
+		layerFromTarEntries(t, tarEntry{path: "a.txt", contents: "alpha"}),
+		failingLayer{},
+	)
+	require.NoError(t, err)
+
+	img := New(v1Img, file.NewTempDirGenerator("partial-read-test"), t.TempDir())
+	t.Cleanup(func() { require.NoError(t, img.Cleanup()) })
+
+	// layer one reads fine and opens its tar, layer two fails. Counting descriptors rather than
+	// reaching for the index, because a failed Read must not leave the half-built layer set behind
+	before := testutil.OpenDescriptorBaseline(t)
+	require.Error(t, img.Read(context.Background()), "expected the second layer to fail the read")
+	require.Equal(t, before, testutil.OpenDescriptorCount(t), "a partial read leaked the first layer's tar")
+
+	// and the image must stay safe to touch: accessors read the last layer, which on a partial read
+	// is one that was never squashed
+	require.Empty(t, img.Layers)
+	require.NotPanics(t, func() {
+		_, _, err := img.SquashedTree().File("/a.txt")
+		require.NoError(t, err)
+	})
+}
+
+// TestImageRead_DiffIDsMatchLayerContents pins the optimization that has Image.Read take layer
+// diff IDs from the image config: what it reports must be what the layers would have computed.
+func TestImageRead_DiffIDsMatchLayerContents(t *testing.T) {
+	layers := []v1.Layer{
+		layerFromTarEntries(t, tarEntry{path: "a.txt", typeFlag: tar.TypeReg, contents: "aaa"}),
+		layerFromTarEntries(t, tarEntry{path: "b.txt", typeFlag: tar.TypeReg, contents: "bbb"}),
+		layerFromTarEntries(t, tarEntry{path: "c.txt", typeFlag: tar.TypeReg, contents: "ccc"}),
+	}
+
+	t.Run("from the config", func(t *testing.T) {
+		img := readImageFromLayers(t, layers...)
+
+		require.Len(t, img.Layers, len(layers))
+		for idx, l := range layers {
+			want, err := l.DiffID()
+			require.NoError(t, err)
+			require.Equal(t, want.String(), img.Layers[idx].Metadata.Digest, "layer %d", idx)
+		}
+	})
+
+	t.Run("falls back to the layer when the config does not line up", func(t *testing.T) {
+		// one fewer diff ID than there are layers, so they cannot be matched up by position
+		img := readImageFromLayersWithConfig(t,
+			func(cfg *v1.ConfigFile) {
+				cfg.RootFS.DiffIDs = cfg.RootFS.DiffIDs[:len(cfg.RootFS.DiffIDs)-1]
+			},
+			layers...,
+		)
+
+		require.Len(t, img.Layers, len(layers))
+		for idx, l := range layers {
+			want, err := l.DiffID()
+			require.NoError(t, err)
+			require.Equal(t, want.String(), img.Layers[idx].Metadata.Digest, "layer %d", idx)
+		}
+	})
+}
+
+func TestImage_ResolveLink_MalformedLinks(t *testing.T) {
+	// a link cycle can be split across layers: it is healthy in the lower layer and only closes in a
+	// higher one, so the reference handed to us here resolves fine where it was found and not here.
+	healthy := filetree.New()
+	realRef, err := healthy.AddFile("/usr/bin/xzcat")
+	require.NoError(t, err)
+	_, err = healthy.AddSymLink("/usr/bin/xz", "/usr/bin/xzcat")
+	require.NoError(t, err)
+
+	cycled := filetree.New()
+	_, err = cycled.AddSymLink("/usr/bin/xz", "/usr/bin/xzcat")
+	require.NoError(t, err)
+	_, err = cycled.AddSymLink("/usr/bin/xzcat", "/usr/bin/xz")
+	require.NoError(t, err)
+
+	img := Image{
+		Layers: []*Layer{
+			{SquashedTree: healthy},
+			{SquashedTree: cycled},
+		},
+	}
+
+	t.Run("layer squash resolves a healthy link", func(t *testing.T) {
+		resolved, err := img.ResolveLinkByLayerSquash(*realRef, 0)
+		require.NoError(t, err)
+		require.True(t, resolved.HasReference())
+	})
+
+	t.Run("layer squash skips a cycle instead of failing the caller", func(t *testing.T) {
+		resolved, err := img.ResolveLinkByLayerSquash(*realRef, 1)
+		require.NoError(t, err)
+		require.False(t, resolved.HasReference())
+	})
+
+	t.Run("image squash skips a cycle instead of failing the caller", func(t *testing.T) {
+		resolved, err := img.ResolveLinkByImageSquash(*realRef)
+		require.NoError(t, err)
+		require.False(t, resolved.HasReference())
+	})
+}
+
+// an opaque whiteout still hides lower layer files when the path to them is a link cycle.
+func TestImage_SquashedTree_OpaqueWhiteoutOverLinkCycle(t *testing.T) {
+	reg, sym := byte(tar.TypeReg), byte(tar.TypeSymlink)
+
+	lower := layerFromTarEntries(t,
+		tarEntry{path: "a", typeFlag: sym, linkPath: "/b"},
+		tarEntry{path: "b", typeFlag: sym, linkPath: "/a"},
+		tarEntry{path: "a/deleted.txt", typeFlag: reg, contents: "hidden by the opaque whiteout above"},
+	)
+	upper := layerFromTarEntries(t,
+		tarEntry{path: "a/.wh..wh..opq", typeFlag: reg},
+		tarEntry{path: "a/kept.txt", typeFlag: reg, contents: "visible"},
+	)
+
+	img := readImageFromLayers(t, lower, upper)
+
+	squash := img.SquashedTree()
+	require.True(t, squash.HasPath("/a/kept.txt"), "the upper layer file should be present")
+	require.Falsef(t, squash.HasPath("/a/deleted.txt"),
+		"opaque whiteout did not hide the lower layer file; squash holds %v", squash.AllRealPaths())
+
+	// the graft must keep the file readable, not just present in the tree
+	rc, err := img.OpenPathFromSquash("/a/kept.txt")
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rc.Close()) }()
+	contents, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.Equal(t, "visible", string(contents))
+}
+
+// a whiteout over a malformed link must not fail the image read. The upper layer carries the link, so
+// grafting it re-forms the cycle instead of breaking it.
+func TestImage_SquashedTree_WhiteoutOverLinkCycle(t *testing.T) {
+	reg, sym := byte(tar.TypeReg), byte(tar.TypeSymlink)
+
+	lower := layerFromTarEntries(t,
+		tarEntry{path: "b", typeFlag: sym, linkPath: "/a"},
+		tarEntry{path: "a/gone.txt", typeFlag: reg, contents: "deleted by the whiteout above"},
+		tarEntry{path: "keep.txt", typeFlag: reg, contents: "untouched"},
+	)
+	upper := layerFromTarEntries(t,
+		tarEntry{path: "a", typeFlag: sym, linkPath: "/b"},
+		tarEntry{path: "a/.wh.gone.txt", typeFlag: reg},
+	)
+
+	img, err := tryReadImageFromLayers(t, lower, upper)
+	require.NoError(t, err, "a malformed link must not fail the image read")
+
+	squash := img.SquashedTree()
+	require.True(t, squash.HasPath("/keep.txt"), "an unrelated file must survive the malformed link")
+	require.Falsef(t, squash.HasPath("/a/gone.txt"),
+		"the whiteout target should not survive; squash holds %v", squash.AllRealPaths())
+}
+
+// an opaque whiteout hides that directory and nothing else. The link target is a separate directory
+// and must survive. This is the shape `rm -rf /link && mkdir /link` produces over a lower-layer link.
+func TestImage_SquashedTree_OpaqueWhiteoutOverSymlinkKeepsTarget(t *testing.T) {
+	reg, sym, dir := byte(tar.TypeReg), byte(tar.TypeSymlink), byte(tar.TypeDir)
+
+	lower := layerFromTarEntries(t,
+		tarEntry{path: "target", typeFlag: dir},
+		tarEntry{path: "target/keep.txt", typeFlag: reg, contents: "survives"},
+		tarEntry{path: "link", typeFlag: sym, linkPath: "/target"},
+	)
+	upper := layerFromTarEntries(t,
+		tarEntry{path: "link", typeFlag: dir},
+		tarEntry{path: "link/.wh..wh..opq", typeFlag: reg},
+		tarEntry{path: "link/new.txt", typeFlag: reg, contents: "new"},
+	)
+
+	img := readImageFromLayers(t, lower, upper)
+
+	squash := img.SquashedTree()
+	require.Truef(t, squash.HasPath("/target/keep.txt"),
+		"the link target is a different directory and must survive; squash holds %v", squash.AllRealPaths())
+	require.True(t, squash.HasPath("/link/new.txt"), "the upper layer file should be present")
 }

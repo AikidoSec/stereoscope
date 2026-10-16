@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"sort"
 	"strings"
 	"sync"
 
@@ -28,7 +27,6 @@ type IndexReader interface {
 	GetByExtension(extensions ...string) ([]IndexEntry, error)
 	GetByBasename(basenames ...string) ([]IndexEntry, error)
 	GetByBasenameGlob(globs ...string) ([]IndexEntry, error)
-	Basenames() []string
 }
 
 type IndexWriter interface {
@@ -134,16 +132,6 @@ func (c *index) Get(f file.Reference) (IndexEntry, error) {
 	return value, nil
 }
 
-func (c *index) Basenames() []string {
-	c.RLock()
-	defer c.RUnlock()
-
-	bns := c.basenames.List()
-	sort.Strings(bns)
-
-	return bns
-}
-
 func (c *index) GetByFileType(fTypes ...file.Type) ([]IndexEntry, error) {
 	c.RLock()
 	defer c.RUnlock()
@@ -219,7 +207,11 @@ func (c *index) GetByExtension(extensions ...string) ([]IndexEntry, error) {
 func (c *index) GetByBasename(basenames ...string) ([]IndexEntry, error) {
 	c.RLock()
 	defer c.RUnlock()
+	return c.getByBasename(basenames...)
+}
 
+// getByBasename is the lock-free implementation of GetByBasename. The caller must hold at least a read lock.
+func (c *index) getByBasename(basenames ...string) ([]IndexEntry, error) {
 	var entries []IndexEntry
 
 	for _, basename := range basenames {
@@ -258,14 +250,20 @@ func (c *index) GetByBasenameGlob(globs ...string) ([]IndexEntry, error) {
 		}
 
 		patternObj := wildmatch.NewWildMatch(glob)
-		for _, b := range c.Basenames() {
+		var e error
+		c.basenames.Each(func(b string) bool {
 			if patternObj.IsMatch(b) {
-				bns, err := c.GetByBasename(b)
+				bns, err := c.getByBasename(b)
 				if err != nil {
-					return nil, fmt.Errorf("unable to fetch file references by basename (%q): %w", b, err)
+					e = fmt.Errorf("unable to fetch file references by basename (%q): %w", b, err)
+					return false
 				}
 				entries = append(entries, bns...)
 			}
+			return true
+		})
+		if e != nil {
+			return nil, e
 		}
 	}
 

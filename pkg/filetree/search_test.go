@@ -6,11 +6,9 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anchore/stereoscope/pkg/file"
-	"github.com/anchore/stereoscope/pkg/filetree/filenode"
 )
 
 func Test_searchContext_SearchByPath(t *testing.T) {
@@ -157,20 +155,6 @@ func Test_searchContext_SearchByGlob(t *testing.T) {
 						RealPath: "/path/to/file.txt",
 					},
 				},
-				{
-
-					RequestPath: "/double-link-to-path/to/file.txt",
-					Reference: &file.Reference{
-						RealPath: "/path/to/file.txt",
-					},
-				},
-				{
-
-					RequestPath: "/link-to-path/to/file.txt",
-					Reference: &file.Reference{
-						RealPath: "/path/to/file.txt",
-					},
-				},
 			},
 		},
 		{
@@ -309,33 +293,6 @@ func Test_searchContext_SearchByGlob(t *testing.T) {
 					RequestPath: "/path/to/file.txt",
 					Reference:   &file.Reference{RealPath: "/path/to/file.txt"},
 				},
-				{
-					RequestPath: "/double-link-to-path/to/file.txt",
-					Reference: &file.Reference{
-						RealPath: "/path/to/file.txt",
-					},
-				},
-				// note: this is NOT expected since the input glob does not match against the request path
-				//{
-				//	Resolution: file.Resolution{
-				//		RequestPath: "/link-to-file",
-				//		Reference: &file.Reference{
-				//			RealPath: "/path/to/file.txt",
-				//		},
-				//	},
-				//	LinkResolutions: []file.Resolution{
-				//		{
-				//			RequestPath: "/link-to-file",
-				//			Reference:   &file.Reference{RealPath: "/link-to-file"},
-				//		},
-				//	},
-				//},
-				{
-					RequestPath: "/link-to-path/to/file.txt",
-					Reference: &file.Reference{
-						RealPath: "/path/to/file.txt",
-					},
-				},
 			},
 		},
 		{
@@ -365,13 +322,6 @@ func Test_searchContext_SearchByGlob(t *testing.T) {
 
 			if d := cmp.Diff(tt.want, got, opts...); d != "" {
 				t.Errorf("SearchByGlob() mismatch (-want +got):\n%s", d)
-			}
-
-			expected, err := tt.fields.tree.FilesByGlob(tt.args.glob, tt.args.options...)
-			require.NoError(t, err)
-
-			if d := cmp.Diff(expected, got, opts...); d != "" {
-				t.Errorf("Difference relative to tree results mismatch (-want +got):\n%s", d)
 			}
 		})
 	}
@@ -456,562 +406,308 @@ func Test_searchContext_SearchByMIMEType(t *testing.T) {
 	}
 }
 
-func Test_searchContext_allPathsToNode(t *testing.T) {
-	type input struct {
-		query *filenode.FileNode
-		sc    *searchContext
+func Test_searchContext_SearchByMIMEType_SkipsLinkCycles(t *testing.T) {
+	tree := New()
+	idx := NewIndex()
+	const mimeType = "application/x-executable"
+
+	for _, p := range []file.Path{
+		"/usr/bin/a-before",
+		"/usr/bin/zz-after",
+	} {
+		ref, err := tree.AddFile(p)
+		require.NoError(t, err)
+		require.NotNil(t, ref)
+		idx.Add(*ref, file.Metadata{MIMEType: mimeType})
+	}
+
+	for path, destination := range map[file.Path]file.Path{
+		"/usr/bin/xz":    "/usr/bin/xzcat",
+		"/usr/bin/xzcat": "/usr/bin/xz",
+	} {
+		ref, err := tree.AddSymLink(path, destination)
+		require.NoError(t, err)
+		require.NotNil(t, ref)
+		idx.Add(*ref, file.Metadata{MIMEType: mimeType, Type: file.TypeSymLink})
+	}
+
+	results, err := NewSearchContext(tree, idx).SearchByMIMEType(mimeType)
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+
+	var paths []string
+	for _, result := range results {
+		paths = append(paths, string(result.RealPath))
+	}
+	require.ElementsMatch(t, []string{
+		"/usr/bin/a-before",
+		"/usr/bin/zz-after",
+	}, paths)
+}
+
+func Test_complexSymlinkPerformance(t *testing.T) {
+	tr := New()
+	idx := NewIndex()
+
+	var realPaths []string
+
+	numPkgs := 30 // with this few packages, the allPathsToNode behavior would essentially hang
+
+	for num := range numPkgs {
+		// add a concrete path
+		realPath := fmt.Sprintf("/pkgs/lib-%d/package.json", num)
+		realPaths = append(realPaths, realPath)
+		r, err := tr.AddFile(file.Path(realPath))
+		require.NoError(t, err)
+		require.NotNil(t, r)
+		idx.Add(*r, file.Metadata{Type: file.TypeRegular})
+
+		// add dependencies on all previous packages
+		for dep := num + 1; dep < numPkgs-1; dep++ {
+			r, err = tr.AddSymLink(file.Path(fmt.Sprintf("/pkgs/lib-%d/libs/lib-%d", num, dep)), file.Path(fmt.Sprintf("/pkgs/lib-%d", dep)))
+			require.NoError(t, err)
+			require.NotNil(t, r)
+			idx.Add(*r, file.Metadata{Type: file.TypeSymLink})
+		}
 	}
 
 	tests := []struct {
-		name    string
-		input   input
-		want    []file.Path
-		wantErr require.ErrorAssertionFunc
+		glob     string
+		expected []string
 	}{
 		{
-			name: "simple dir",
-			want: []file.Path{
-				"/path/to",
-			},
-			input: func() input {
-				tree := New()
-
-				fileRef, err := tree.AddFile("/path/to/file.txt")
-				require.NoError(t, err)
-				require.NotNil(t, fileRef)
-
-				idx := NewIndex()
-				idx.Add(*fileRef, file.Metadata{MIMEType: "plain/text", Type: file.TypeRegular})
-
-				na, err := tree.node("/path/to", linkResolutionStrategy{
-					FollowAncestorLinks:          false,
-					FollowBasenameLinks:          false,
-					DoNotFollowDeadBasenameLinks: false,
-				})
-				require.NoError(t, err)
-				require.NotNil(t, na)
-				require.NotNil(t, na.FileNode)
-				require.Equal(t, file.Path("/path/to"), na.FileNode.RealPath)
-
-				return input{
-					query: na.FileNode,
-					sc:    NewSearchContext(tree, idx).(*searchContext),
-				}
-			}(),
-		},
-		{
-			name: "dead symlink",
-			want: []file.Path{
-				"/path/to/file.txt",
-			},
-			input: func() input {
-				tree := New()
-
-				deafLinkRef, err := tree.AddSymLink("/link-to-file", "/path/to/dead/file.txt")
-				require.NoError(t, err)
-				require.NotNil(t, deafLinkRef)
-
-				fileRef, err := tree.AddFile("/path/to/file.txt")
-				require.NoError(t, err)
-				require.NotNil(t, fileRef)
-
-				idx := NewIndex()
-				idx.Add(*fileRef, file.Metadata{MIMEType: "plain/text", Type: file.TypeRegular})
-				idx.Add(*deafLinkRef, file.Metadata{Type: file.TypeSymLink})
-
-				na, err := tree.node(fileRef.RealPath, linkResolutionStrategy{
-					FollowAncestorLinks:          false,
-					FollowBasenameLinks:          false,
-					DoNotFollowDeadBasenameLinks: false,
-				})
-				require.NoError(t, err)
-				require.NotNil(t, na)
-				require.NotNil(t, na.FileNode)
-				require.Equalf(t, fileRef.ID(), na.FileNode.Reference.ID(), "query node should be the same as the file node")
-
-				return input{
-					query: na.FileNode,
-					sc:    NewSearchContext(tree, idx).(*searchContext),
-				}
-			}(),
-		},
-		{
-			name: "symlink triangle cycle",
-			want: []file.Path{
-				"/1",
-				"/2",
-				"/3",
-			},
-			input: func() input {
-				tree := New()
-
-				link1, err := tree.AddSymLink("/1", "/2")
-				require.NoError(t, err)
-				require.NotNil(t, link1)
-
-				link2, err := tree.AddSymLink("/2", "/3")
-				require.NoError(t, err)
-				require.NotNil(t, link2)
-
-				link3, err := tree.AddSymLink("/3", "/1")
-				require.NoError(t, err)
-				require.NotNil(t, link3)
-
-				idx := NewIndex()
-				idx.Add(*link1, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*link2, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*link3, file.Metadata{Type: file.TypeSymLink})
-
-				na, err := tree.node(link1.RealPath, linkResolutionStrategy{
-					FollowAncestorLinks:          false,
-					FollowBasenameLinks:          false,
-					DoNotFollowDeadBasenameLinks: false,
-				})
-				require.NoError(t, err)
-				require.NotNil(t, na)
-				require.NotNil(t, na.FileNode)
-				require.Equalf(t, link1.ID(), na.FileNode.Reference.ID(), "query node should be the same as the first link")
-
-				return input{
-					query: na.FileNode,
-					sc:    NewSearchContext(tree, idx).(*searchContext),
-				}
-			}(),
-		},
-		{
-			// note: this isn't a real link cycle, but it does look like one while resolving from a leaf to the root
-			name: "reverse symlink cycle",
-			want: []file.Path{
-				"/bin/ttyd",
-				"/usr/bin/X11/ttyd",
-				"/usr/bin/ttyd",
-			},
-			input: func() input {
-				tree := New()
-
-				usrRef, err := tree.AddDir("/usr")
-				require.NoError(t, err)
-				require.NotNil(t, usrRef)
-
-				usrBinRef, err := tree.AddDir("/usr/bin")
-				require.NoError(t, err)
-				require.NotNil(t, usrBinRef)
-
-				ttydRef, err := tree.AddFile("/usr/bin/ttyd")
-				require.NoError(t, err)
-				require.NotNil(t, ttydRef)
-
-				binLinkRef, err := tree.AddSymLink("/bin", "usr/bin")
-				require.NoError(t, err)
-				require.NotNil(t, binLinkRef)
-
-				x11LinkRef, err := tree.AddSymLink("/usr/bin/X11", ".")
-				require.NoError(t, err)
-				require.NotNil(t, x11LinkRef)
-
-				idx := NewIndex()
-				idx.Add(*usrRef, file.Metadata{Type: file.TypeDirectory})
-				idx.Add(*usrBinRef, file.Metadata{Type: file.TypeDirectory})
-				idx.Add(*binLinkRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*x11LinkRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*ttydRef, file.Metadata{Type: file.TypeRegular})
-
-				na, err := tree.node(ttydRef.RealPath, linkResolutionStrategy{
-					FollowAncestorLinks:          false,
-					FollowBasenameLinks:          false,
-					DoNotFollowDeadBasenameLinks: false,
-				})
-				require.NoError(t, err)
-				require.NotNil(t, na)
-				require.NotNil(t, na.FileNode)
-				require.Equalf(t, ttydRef.ID(), na.FileNode.Reference.ID(), "query node should be the same as usr/bin/ttyd binary")
-
-				return input{
-					query: na.FileNode,
-					sc:    NewSearchContext(tree, idx).(*searchContext),
-				}
-			}(),
-		},
-		{
-			name: "single leaf symlink",
-			want: []file.Path{
-				"/link-to-file",
-				"/path/to/file.txt",
-			},
-			input: func() input {
-				tree := New()
-
-				linkToFileRef, err := tree.AddSymLink("/link-to-file", "/path/to/file.txt")
-				require.NoError(t, err)
-				require.NotNil(t, linkToFileRef)
-
-				fileRef, err := tree.AddFile("/path/to/file.txt")
-				require.NoError(t, err)
-				require.NotNil(t, fileRef)
-
-				idx := NewIndex()
-				idx.Add(*fileRef, file.Metadata{MIMEType: "plain/text", Type: file.TypeRegular})
-				idx.Add(*linkToFileRef, file.Metadata{Type: file.TypeSymLink})
-
-				na, err := tree.node(fileRef.RealPath, linkResolutionStrategy{
-					FollowAncestorLinks:          false,
-					FollowBasenameLinks:          false,
-					DoNotFollowDeadBasenameLinks: false,
-				})
-				require.NoError(t, err)
-				require.NotNil(t, na)
-				require.NotNil(t, na.FileNode)
-				require.Equalf(t, fileRef.ID(), na.FileNode.Reference.ID(), "query node should be the same as the file node")
-
-				return input{
-					query: na.FileNode,
-					sc:    NewSearchContext(tree, idx).(*searchContext),
-				}
-			}(),
-		},
-		{
-			name: "2 deep leaf symlink",
-			want: []file.Path{
-				"/double-link-to-file",
-				"/link-to-file",
-				"/path/to/file.txt",
-			},
-			input: func() input {
-				tree := New()
-
-				doubleLinkToFileRef, err := tree.AddSymLink("/double-link-to-file", "/link-to-file")
-				require.NoError(t, err)
-				require.NotNil(t, doubleLinkToFileRef)
-
-				linkToFileRef, err := tree.AddSymLink("/link-to-file", "/path/to/file.txt")
-				require.NoError(t, err)
-				require.NotNil(t, linkToFileRef)
-
-				fileRef, err := tree.AddFile("/path/to/file.txt")
-				require.NoError(t, err)
-				require.NotNil(t, fileRef)
-
-				idx := NewIndex()
-				idx.Add(*fileRef, file.Metadata{MIMEType: "plain/text", Type: file.TypeRegular})
-				idx.Add(*linkToFileRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*doubleLinkToFileRef, file.Metadata{Type: file.TypeSymLink})
-
-				na, err := tree.node(fileRef.RealPath, linkResolutionStrategy{
-					FollowAncestorLinks:          false,
-					FollowBasenameLinks:          false,
-					DoNotFollowDeadBasenameLinks: false,
-				})
-				require.NoError(t, err)
-				require.NotNil(t, na)
-				require.NotNil(t, na.FileNode)
-				require.Equalf(t, fileRef.ID(), na.FileNode.Reference.ID(), "query node should be the same as the file node")
-
-				return input{
-					query: na.FileNode,
-					sc:    NewSearchContext(tree, idx).(*searchContext),
-				}
-			}(),
-		},
-		{
-			name: "single ancestor symlink",
-			want: []file.Path{
-				"/link-to-to/file.txt",
-				"/path/to/file.txt",
-			},
-			input: func() input {
-				tree := New()
-
-				dirTo, err := tree.AddDir("/path/to")
-				require.NoError(t, err)
-				require.NotNil(t, dirTo)
-
-				linkToToRef, err := tree.AddSymLink("/link-to-to", "/path/to")
-				require.NoError(t, err)
-				require.NotNil(t, linkToToRef)
-
-				fileRef, err := tree.AddFile("/path/to/file.txt")
-				require.NoError(t, err)
-				require.NotNil(t, fileRef)
-
-				idx := NewIndex()
-				idx.Add(*fileRef, file.Metadata{MIMEType: "plain/text", Type: file.TypeRegular})
-				idx.Add(*linkToToRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*dirTo, file.Metadata{Type: file.TypeDirectory})
-
-				na, err := tree.node(fileRef.RealPath, linkResolutionStrategy{
-					FollowAncestorLinks:          false,
-					FollowBasenameLinks:          false,
-					DoNotFollowDeadBasenameLinks: false,
-				})
-				require.NoError(t, err)
-				require.NotNil(t, na)
-				require.NotNil(t, na.FileNode)
-				require.Equalf(t, fileRef.ID(), na.FileNode.Reference.ID(), "query node should be the same as the file node")
-
-				return input{
-					query: na.FileNode,
-					sc:    NewSearchContext(tree, idx).(*searchContext),
-				}
-			}(),
-		},
-		{
-			name: "2 deep, single sibling ancestor symlink",
-			want: []file.Path{
-				"/link-to-path/to/file.txt",
-				"/link-to-to/file.txt",
-				"/path/to/file.txt",
-			},
-			input: func() input {
-				tree := New()
-
-				dirTo, err := tree.AddDir("/path/to")
-				require.NoError(t, err)
-				require.NotNil(t, dirTo)
-
-				linkToPathRef, err := tree.AddSymLink("/link-to-path", "/path")
-				require.NoError(t, err)
-				require.NotNil(t, linkToPathRef)
-
-				linkToToRef, err := tree.AddSymLink("/link-to-to", "/path/to")
-				require.NoError(t, err)
-				require.NotNil(t, linkToToRef)
-
-				fileRef, err := tree.AddFile("/path/to/file.txt")
-				require.NoError(t, err)
-				require.NotNil(t, fileRef)
-
-				idx := NewIndex()
-				idx.Add(*fileRef, file.Metadata{MIMEType: "plain/text", Type: file.TypeRegular})
-				idx.Add(*linkToToRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*linkToPathRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*dirTo, file.Metadata{Type: file.TypeDirectory})
-
-				na, err := tree.node(fileRef.RealPath, linkResolutionStrategy{
-					FollowAncestorLinks:          false,
-					FollowBasenameLinks:          false,
-					DoNotFollowDeadBasenameLinks: false,
-				})
-				require.NoError(t, err)
-				require.NotNil(t, na)
-				require.NotNil(t, na.FileNode)
-				require.Equalf(t, fileRef.ID(), na.FileNode.Reference.ID(), "query node should be the same as the file node")
-
-				return input{
-					query: na.FileNode,
-					sc:    NewSearchContext(tree, idx).(*searchContext),
-				}
-			}(),
-		},
-		{
-			name: "2 deep, multiple sibling ancestor symlink",
-			want: []file.Path{
-				"/another-link-to-path/to/file.txt",
-				"/another-link-to-to/file.txt",
-				"/link-to-path/to/file.txt",
-				"/link-to-to/file.txt",
-				"/path/to/file.txt",
-			},
-			input: func() input {
-				tree := New()
-
-				dirTo, err := tree.AddDir("/path/to")
-				require.NoError(t, err)
-				require.NotNil(t, dirTo)
-
-				linkToPathRef, err := tree.AddSymLink("/link-to-path", "/path")
-				require.NoError(t, err)
-				require.NotNil(t, linkToPathRef)
-
-				anotherLinkToPathRef, err := tree.AddSymLink("/another-link-to-path", "/path")
-				require.NoError(t, err)
-				require.NotNil(t, anotherLinkToPathRef)
-
-				linkToToRef, err := tree.AddSymLink("/link-to-to", "/path/to")
-				require.NoError(t, err)
-				require.NotNil(t, linkToToRef)
-
-				anotherLinkToToRef, err := tree.AddSymLink("/another-link-to-to", "/path/to")
-				require.NoError(t, err)
-				require.NotNil(t, anotherLinkToToRef)
-
-				fileRef, err := tree.AddFile("/path/to/file.txt")
-				require.NoError(t, err)
-				require.NotNil(t, fileRef)
-
-				idx := NewIndex()
-				idx.Add(*fileRef, file.Metadata{MIMEType: "plain/text", Type: file.TypeRegular})
-				idx.Add(*linkToToRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*linkToPathRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*anotherLinkToPathRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*anotherLinkToToRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*dirTo, file.Metadata{Type: file.TypeDirectory})
-
-				na, err := tree.node(fileRef.RealPath, linkResolutionStrategy{
-					FollowAncestorLinks:          false,
-					FollowBasenameLinks:          false,
-					DoNotFollowDeadBasenameLinks: false,
-				})
-				require.NoError(t, err)
-				require.NotNil(t, na)
-				require.NotNil(t, na.FileNode)
-				require.Equalf(t, fileRef.ID(), na.FileNode.Reference.ID(), "query node should be the same as the file node")
-
-				return input{
-					query: na.FileNode,
-					sc:    NewSearchContext(tree, idx).(*searchContext),
-				}
-			}(),
-		},
-		{
-			name: "2 deep, multiple nested ancestor symlink",
-			want: []file.Path{
-				"/link-to-path/link-to-another/file.txt",
-				"/link-to-path/to/another/file.txt",
-				"/link-to-path/to/link-to-file",
-				"/link-to-to/another/file.txt",
-				"/link-to-to/link-to-file",
-				"/path/link-to-another/file.txt",
-				"/path/to/another/file.txt",
-				"/path/to/link-to-file",
-			},
-			input: func() input {
-				tree := New()
-
-				linkToAnotherViaLinkRef, err := tree.AddSymLink("/path/link-to-another", "/link-to-to/another")
-				require.NoError(t, err)
-				require.NotNil(t, linkToAnotherViaLinkRef)
-
-				linkToPathRef, err := tree.AddSymLink("/link-to-path", "/path")
-				require.NoError(t, err)
-				require.NotNil(t, linkToPathRef)
-
-				linkToToRef, err := tree.AddSymLink("/link-to-to", "/path/to")
-				require.NoError(t, err)
-				require.NotNil(t, linkToToRef)
-
-				pathToLinkToFileRef, err := tree.AddSymLink("/path/to/link-to-file", "/path/to/another/file.txt")
-				require.NoError(t, err)
-				require.NotNil(t, pathToLinkToFileRef)
-
-				dirTo, err := tree.AddDir("/path/to")
-				require.NoError(t, err)
-				require.NotNil(t, dirTo)
-
-				dirAnother, err := tree.AddDir("/path/to/another")
-				require.NoError(t, err)
-				require.NotNil(t, dirAnother)
-
-				fileRef, err := tree.AddFile("/path/to/another/file.txt")
-				require.NoError(t, err)
-				require.NotNil(t, fileRef)
-
-				idx := NewIndex()
-				idx.Add(*fileRef, file.Metadata{MIMEType: "plain/text", Type: file.TypeRegular})
-				idx.Add(*linkToAnotherViaLinkRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*linkToPathRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*linkToToRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*pathToLinkToFileRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*dirTo, file.Metadata{Type: file.TypeDirectory})
-				idx.Add(*dirAnother, file.Metadata{Type: file.TypeDirectory})
-
-				na, err := tree.node(fileRef.RealPath, linkResolutionStrategy{
-					FollowAncestorLinks:          false,
-					FollowBasenameLinks:          false,
-					DoNotFollowDeadBasenameLinks: false,
-				})
-				require.NoError(t, err)
-				require.NotNil(t, na)
-				require.NotNil(t, na.FileNode)
-				require.Equalf(t, fileRef.ID(), na.FileNode.Reference.ID(), "query node should be the same as the file node")
-
-				return input{
-					query: na.FileNode,
-					sc:    NewSearchContext(tree, idx).(*searchContext),
-				}
-			}(),
-		},
-		{
-			name: "relative, 2 deep, multiple nested ancestor symlink",
-			want: []file.Path{
-				"/link-to-path/link-to-another/file.txt",
-				"/link-to-path/to/another/file.txt",
-				"/link-to-path/to/link-to-file",
-				"/link-to-to/another/file.txt",
-				"/link-to-to/link-to-file",
-				"/path/link-to-another/file.txt",
-				"/path/to/another/file.txt",
-				"/path/to/link-to-file",
-			},
-			input: func() input {
-				tree := New()
-
-				linkToAnotherViaLinkRef, err := tree.AddSymLink("/path/link-to-another", "../link-to-to/another")
-				require.NoError(t, err)
-				require.NotNil(t, linkToAnotherViaLinkRef)
-
-				linkToPathRef, err := tree.AddSymLink("/link-to-path", "./path")
-				require.NoError(t, err)
-				require.NotNil(t, linkToPathRef)
-
-				linkToToRef, err := tree.AddSymLink("/link-to-to", "./path/to")
-				require.NoError(t, err)
-				require.NotNil(t, linkToToRef)
-
-				pathToLinkToFileRef, err := tree.AddSymLink("/path/to/link-to-file", "../to/another/file.txt")
-				require.NoError(t, err)
-				require.NotNil(t, pathToLinkToFileRef)
-
-				dirTo, err := tree.AddDir("/path/to")
-				require.NoError(t, err)
-				require.NotNil(t, dirTo)
-
-				dirAnother, err := tree.AddDir("/path/to/another")
-				require.NoError(t, err)
-				require.NotNil(t, dirAnother)
-
-				fileRef, err := tree.AddFile("/path/to/another/file.txt")
-				require.NoError(t, err)
-				require.NotNil(t, fileRef)
-
-				idx := NewIndex()
-				idx.Add(*fileRef, file.Metadata{MIMEType: "plain/text", Type: file.TypeRegular})
-				idx.Add(*linkToAnotherViaLinkRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*linkToPathRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*linkToToRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*pathToLinkToFileRef, file.Metadata{Type: file.TypeSymLink})
-				idx.Add(*dirTo, file.Metadata{Type: file.TypeDirectory})
-				idx.Add(*dirAnother, file.Metadata{Type: file.TypeDirectory})
-
-				na, err := tree.node(fileRef.RealPath, linkResolutionStrategy{
-					FollowAncestorLinks:          false,
-					FollowBasenameLinks:          false,
-					DoNotFollowDeadBasenameLinks: false,
-				})
-				require.NoError(t, err)
-				require.NotNil(t, na)
-				require.NotNil(t, na.FileNode)
-				require.Equalf(t, fileRef.ID(), na.FileNode.Reference.ID(), "query node should be the same as the file node")
-
-				return input{
-					query: na.FileNode,
-					sc:    NewSearchContext(tree, idx).(*searchContext),
-				}
-			}(),
+			glob:     "**/package.json",
+			expected: realPaths,
 		},
 	}
+
+	for _, tt := range tests {
+		t.Run(tt.glob, func(t *testing.T) {
+			sc := NewSearchContext(tr, idx)
+			gotResolutions, err := sc.SearchByGlob(tt.glob, FollowBasenameLinks)
+			require.NoError(t, err)
+			require.NotNil(t, gotResolutions)
+			var got []string
+			for _, gotResolution := range gotResolutions {
+				got = append(got, string(gotResolution.RealPath))
+			}
+			require.ElementsMatch(t, tt.expected, got)
+		})
+	}
+}
+
+func Test_nextSegment(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		start    int
+		expected int
+	}{
+		{name: "empty", input: "", start: 0, expected: -1},
+		{name: "empty after", input: "", start: 1, expected: -1},
+		{name: "no slash", input: "abc", start: 0, expected: 3},
+		{name: "no slash after", input: "abc", start: 3, expected: -1},
+		{name: "end slash", input: "abc/", start: 0, expected: 3},
+		{name: "end slash after", input: "abc/", start: 4, expected: -1},
+		{name: "single begin", input: "/a", start: 0, expected: 0},
+		{name: "single after", input: "/ab1", start: 1, expected: 4},
+		{name: "single end", input: "/ab1", start: 4, expected: -1},
+		{name: "multiple first", input: "/a/b/c", start: 0, expected: 0},
+		{name: "multiple mid", input: "/a/b/c", start: 1, expected: 2},
+		{name: "multiple last", input: "/a/b/c", start: 3, expected: 4},
+		{name: "multiple after", input: "/a/b/c", start: 5, expected: 6},
+		{name: "multiple end", input: "/a/b/c", start: 6, expected: -1},
+	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.wantErr == nil {
-				tt.wantErr = require.NoError
+			got := nextSegment(tt.input, tt.start)
+			if got < 0 {
+				got = -1
 			}
+			require.Equal(t, tt.expected, got)
+		})
+	}
+}
 
-			got, err := tt.input.sc.allPathsToNode(tt.input.query)
-			tt.wantErr(t, err, fmt.Sprintf("allPathsToNode(%v)", tt.input.query))
-			if err != nil {
-				return
+// cycleSearchFixture builds a tree+index with a two-node symlink cycle among regular indexed files.
+func cycleSearchFixture(t *testing.T, dir string, mimeType string) (*FileTree, Index) {
+	t.Helper()
+	tree := New()
+	idx := NewIndex()
+
+	for _, d := range file.Path(dir).AllPaths() {
+		if d == "/" {
+			continue
+		}
+		ref, err := tree.AddDir(d)
+		require.NoError(t, err)
+		require.NotNil(t, ref)
+		idx.Add(*ref, file.Metadata{Type: file.TypeDirectory})
+	}
+
+	for _, name := range []string{"a-before", "zz-after"} {
+		ref, err := tree.AddFile(file.Path(dir + "/" + name))
+		require.NoError(t, err)
+		require.NotNil(t, ref)
+		idx.Add(*ref, file.Metadata{MIMEType: mimeType})
+	}
+
+	for from, to := range map[file.Path]file.Path{
+		file.Path(dir + "/xz"):    file.Path(dir + "/xzcat"),
+		file.Path(dir + "/xzcat"): file.Path(dir + "/xz"),
+	} {
+		ref, err := tree.AddSymLink(from, to)
+		require.NoError(t, err)
+		require.NotNil(t, ref)
+		idx.Add(*ref, file.Metadata{MIMEType: mimeType, Type: file.TypeSymLink})
+	}
+
+	return tree, idx
+}
+
+// this is the path the dpkg cataloger takes when building package-file relationships, and the first error
+// reported in the original issue.
+func Test_searchContext_SearchByPath_SkipsLinkCycles(t *testing.T) {
+	tree, idx := cycleSearchFixture(t, "/usr/bin", "application/x-executable")
+
+	ref, err := NewSearchContext(tree, idx).SearchByPath("/usr/bin/xz")
+	require.NoError(t, err)
+	require.Nil(t, ref)
+
+	// the healthy neighbors must still resolve
+	ref, err = NewSearchContext(tree, idx).SearchByPath("/usr/bin/a-before")
+	require.NoError(t, err)
+	require.NotNil(t, ref)
+}
+
+// the sub-directory search basis (e.g. **/var/lib/dpkg/status.d/*) resolves entries by listing the parent,
+// which is a separate path from the MIME-type search.
+func Test_searchContext_SearchByGlob_SubDirectory_SkipsLinkCycles(t *testing.T) {
+	tree, idx := cycleSearchFixture(t, "/var/lib/dpkg/status.d", "text/plain")
+
+	results, err := NewSearchContext(tree, idx).SearchByGlob("**/status.d/*")
+	require.NoError(t, err)
+
+	var paths []string
+	for _, result := range results {
+		paths = append(paths, string(result.RealPath))
+	}
+	require.ElementsMatch(t, []string{
+		"/var/lib/dpkg/status.d/a-before",
+		"/var/lib/dpkg/status.d/zz-after",
+	}, paths)
+}
+
+func Test_searchContext_SearchByMIMEType_SkipsExcessiveLinkDepth(t *testing.T) {
+	const mimeType = "application/x-executable"
+	tree := New()
+	idx := NewIndex()
+
+	for _, name := range []string{"a-before", "zz-after"} {
+		ref, err := tree.AddFile(file.Path("/usr/bin/" + name))
+		require.NoError(t, err)
+		idx.Add(*ref, file.Metadata{MIMEType: mimeType})
+	}
+	for i := 0; i < maxLinkResolutionDepth+20; i++ {
+		ref, err := tree.AddSymLink(
+			file.Path(fmt.Sprintf("/usr/bin/l%04d", i)),
+			file.Path(fmt.Sprintf("/usr/bin/l%04d", i+1)),
+		)
+		require.NoError(t, err)
+		idx.Add(*ref, file.Metadata{MIMEType: mimeType, Type: file.TypeSymLink})
+	}
+
+	results, err := NewSearchContext(tree, idx).SearchByMIMEType(mimeType)
+	require.NoError(t, err)
+
+	var paths []string
+	for _, result := range results {
+		paths = append(paths, string(result.RealPath))
+	}
+	require.Subset(t, paths, []string{"/usr/bin/a-before", "/usr/bin/zz-after"})
+}
+
+// a malformed link anywhere in the image must not cost us the backward-reference index, which is what
+// lets searches find files through symlinked parent directories. This is a differential test on purpose:
+// asserting "no error" would not have caught the index silently emptying itself.
+func Test_searchContext_LinkCycleDoesNotDropUnrelatedResults(t *testing.T) {
+	const mimeType = "text/plain"
+
+	// buildLinkResolutionIndex reaches the tree twice, and a malformed link can enter through either. Both are
+	// covered here because they are separate call sites and fixing one silently leaves the other.
+	const (
+		noCycle = iota
+		// a link that IS in the tree, reached while walking the index entries
+		cycleViaTreeLink
+		// an entry that is in the INDEX but not in this tree, reached while filtering entries down to this
+		// tree. An index spans every layer while a search context is one squashed tree, so this is ordinary.
+		cycleViaIndexOnlyEntry
+	)
+
+	build := func(t *testing.T, mode int) Searcher {
+		t.Helper()
+		tree := New()
+		idx := NewIndex()
+
+		ref, err := tree.AddFile("/usr/bin/legit")
+		require.NoError(t, err)
+		idx.Add(*ref, file.Metadata{MIMEType: mimeType})
+
+		switch mode {
+		case cycleViaTreeLink:
+			// an unrelated malformed link. note: index entries come back sorted by file.ID, which is a
+			// process-global counter, so these have to be CREATED before the healthy link below; otherwise the
+			// healthy backward reference is already registered by the time the bad link truncates the index and
+			// nothing is observable.
+			for _, l := range []struct{ from, to file.Path }{{"/x", "/y"}, {"/y", "/x"}, {"/through", "/x/foo"}} {
+				ref, err = tree.AddSymLink(l.from, l.to)
+				require.NoError(t, err)
+				idx.Add(*ref, file.Metadata{Type: file.TypeSymLink})
 			}
+		case cycleViaIndexOnlyEntry:
+			for _, l := range []struct{ from, to file.Path }{{"/x", "/y"}, {"/y", "/x"}} {
+				_, err = tree.AddSymLink(l.from, l.to)
+				require.NoError(t, err)
+			}
+			// deliberately NOT added to the tree, so filtering it falls through to ancestor resolution and
+			// trips the cycle at /x. Ordering does not matter here: this aborts before any backward reference
+			// is registered, so the whole index is lost rather than a suffix of it.
+			ghost := file.NewFileReference("/x/ghost")
+			idx.Add(*ghost, file.Metadata{Type: file.TypeSymLink})
+		}
 
-			assert.ElementsMatchf(t, tt.want, got, cmp.Diff(tt.want, got), "expected and actual paths should match")
+		// a healthy directory link: /bin/legit is a legitimate second path to the same file
+		ref, err = tree.AddSymLink("/bin", "/usr/bin")
+		require.NoError(t, err)
+		idx.Add(*ref, file.Metadata{Type: file.TypeSymLink})
+
+		return NewSearchContext(tree, idx)
+	}
+
+	paths := func(t *testing.T, refs []file.Resolution) []string {
+		t.Helper()
+		var out []string
+		for _, r := range refs {
+			out = append(out, string(r.RealPath))
+		}
+		return out
+	}
+
+	clean, err := build(t, noCycle).SearchByGlob("/bin/leg*")
+	require.NoError(t, err)
+	require.Equal(t, []string{"/usr/bin/legit"}, paths(t, clean))
+
+	for name, mode := range map[string]int{
+		"cycle via a link in the tree":  cycleViaTreeLink,
+		"cycle via an index-only entry": cycleViaIndexOnlyEntry,
+	} {
+		t.Run(name, func(t *testing.T) {
+			withCycle, err := build(t, mode).SearchByGlob("/bin/leg*")
+			require.NoError(t, err)
+
+			// the cycle is unrelated to this glob, so the results must be identical
+			require.Equal(t, paths(t, clean), paths(t, withCycle))
 		})
 	}
 }

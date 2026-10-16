@@ -41,11 +41,31 @@ func (c *FileCatalog) Add(f file.Reference, m file.Metadata, l *Layer, opener fi
 	c.addImageReferences(f.ID(), l, opener)
 }
 
+func (c *FileCatalog) AssociateOpener(f file.Reference, opener file.Opener) {
+	c.addImageReferences(f.ID(), nil, opener)
+}
+
+func (c *FileCatalog) AssociateLayer(f file.Reference, l *Layer) {
+	c.addImageReferences(f.ID(), l, nil)
+}
+
 func (c *FileCatalog) addImageReferences(id file.ID, l *Layer, opener file.Opener) {
 	c.Lock()
 	defer c.Unlock()
-	c.layerByID[id] = l
-	c.openerByID[id] = opener
+	if l != nil {
+		c.layerByID[id] = l
+	}
+	if opener != nil {
+		c.openerByID[id] = opener
+	}
+}
+
+// opener returns the opener for the given file ID, or nil if there is none.
+func (c *FileCatalog) opener(id file.ID) file.Opener {
+	c.RLock()
+	defer c.RUnlock()
+
+	return c.openerByID[id]
 }
 
 func (c *FileCatalog) Layer(f file.Reference) *Layer {

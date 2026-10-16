@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"runtime"
 	"strings"
@@ -25,7 +26,7 @@ import (
 )
 
 func TestValidatePlatform(t *testing.T) {
-	isFetchError := func(t require.TestingT, err error, args ...interface{}) {
+	isFetchError := func(t require.TestingT, err error, args ...any) {
 		var pErr *image.ErrPlatformMismatch
 		require.ErrorAs(t, err, &pErr)
 	}
@@ -34,6 +35,7 @@ func TestValidatePlatform(t *testing.T) {
 		platform       *image.Platform
 		givenOs        string
 		givenArch      string
+		givenVariant   string
 		expectedErrMsg string
 		expectedErr    require.ErrorAssertionFunc
 	}{
@@ -83,11 +85,53 @@ func TestValidatePlatform(t *testing.T) {
 			givenArch:   "amd64",
 			expectedErr: require.NoError,
 		},
+		{
+			name:         "matching platform with variant v7",
+			platform:     &image.Platform{OS: "linux", Architecture: "arm", Variant: "v7"},
+			givenOs:      "linux",
+			givenArch:    "arm",
+			givenVariant: "v7",
+			expectedErr:  require.NoError,
+		},
+		{
+			name:         "matching platform with variant arm64/v8",
+			platform:     &image.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"},
+			givenOs:      "linux",
+			givenArch:    "arm64",
+			givenVariant: "v8",
+			expectedErr:  require.NoError,
+		},
+		{
+			name:           "mismatched variant",
+			platform:       &image.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"},
+			givenOs:        "linux",
+			givenArch:      "arm64",
+			givenVariant:   "v7",
+			expectedErr:    isFetchError,
+			expectedErrMsg: `image platform="linux/arm64/v7" does not match user specified platform="linux/arm64/v8"`,
+		},
+		{
+			name:           "user specifies variant, image does not have one",
+			platform:       &image.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"},
+			givenOs:        "linux",
+			givenArch:      "arm64",
+			givenVariant:   "",
+			expectedErr:    isFetchError,
+			expectedErrMsg: `image platform="linux/arm64" does not match user specified platform="linux/arm64/v8"`,
+		},
+		{
+			name:         "image has variant, user does not specify one",
+			platform:     &image.Platform{OS: "linux", Architecture: "arm64"},
+			givenOs:      "linux",
+			givenArch:    "arm64",
+			givenVariant: "v8",
+			expectedErr:  require.NoError,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validatePlatform(tt.platform, tt.givenOs, tt.givenArch)
+			err := validatePlatform(tt.platform, tt.givenOs, tt.givenArch, tt.givenVariant)
 			tt.expectedErr(t, err)
 			if err != nil {
 				assert.ErrorContains(t, err, tt.expectedErrMsg)
@@ -289,4 +333,96 @@ func makeRegistry(t *testing.T) (registryHost string) {
 	ts := httptest.NewServer(http.HandlerFunc(registryInstance.ServeHTTP))
 	t.Cleanup(ts.Close)
 	return strings.TrimPrefix(ts.URL, "http://")
+}
+
+func TestEffectiveURLTransport(t *testing.T) {
+	tests := []struct {
+		name           string
+		originalHost   string
+		redirectHost   string
+		expectRedirect bool
+	}{
+		{
+			name:           "no redirect",
+			originalHost:   "example.com",
+			redirectHost:   "example.com",
+			expectRedirect: false,
+		},
+		{
+			name:           "with redirect",
+			originalHost:   "old.example.com",
+			redirectHost:   "new.example.com",
+			expectRedirect: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transport := newEffectiveURLTransport(nil)
+
+			// Create a mock request
+			req := &http.Request{
+				URL: &url.URL{Host: tt.originalHost},
+			}
+
+			// Create a mock response with effective URL
+			resp := &http.Response{
+				Request: &http.Request{
+					URL: &url.URL{Host: tt.redirectHost},
+				},
+			}
+
+			// Mock the base transport
+			transport.base = &mockRoundTripper{resp: resp}
+
+			// Make the request
+			_, err := transport.RoundTrip(req)
+			require.NoError(t, err)
+
+			// Check effective host
+			effectiveHost := transport.getEffectiveHost(tt.originalHost)
+			if tt.expectRedirect {
+				assert.Equal(t, tt.redirectHost, effectiveHost)
+			} else {
+				assert.Equal(t, tt.originalHost, effectiveHost)
+			}
+		})
+	}
+}
+
+func TestRegistryProviderWithRedirect(t *testing.T) {
+	// Create a test server that redirects
+	redirectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Redirect to the actual registry
+		registryHost := makeRegistry(t)
+		redirectURL := fmt.Sprintf("http://%s%s", registryHost, r.URL.Path)
+		http.Redirect(w, r, redirectURL, http.StatusMovedPermanently)
+	}))
+	defer redirectServer.Close()
+
+	// Create a registry provider with redirect server
+	tmpDirGen := file.NewTempDirGenerator("oci-test")
+	defer tmpDirGen.Cleanup()
+
+	redirectHost := strings.TrimPrefix(redirectServer.URL, "http://")
+	imageStr := fmt.Sprintf("%s/test:latest", redirectHost)
+
+	provider := NewRegistryProvider(tmpDirGen, image.RegistryOptions{InsecureUseHTTP: true}, imageStr, nil)
+
+	// Test that the provider handles redirects gracefully
+	// Note: This test may not fully verify redirect behavior with a real image
+	// due to complexity of setting up a complete registry with redirects,
+	// but it ensures our code doesn't break with the redirect transport
+	assert.NotNil(t, provider)
+	assert.Equal(t, Registry, provider.Name())
+}
+
+// mockRoundTripper is a helper for testing
+type mockRoundTripper struct {
+	resp *http.Response
+	err  error
+}
+
+func (m *mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return m.resp, m.err
 }

@@ -3,12 +3,15 @@ package image
 import (
 	"crypto/x509"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/docker/go-connections/tlsconfig"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/anchore/stereoscope/internal/testutil"
 )
 
 func TestRegistryOptions_AuthenticationOptions(t *testing.T) {
@@ -512,7 +515,10 @@ func TestRegistryOptions_selectMostSpecificCredentials(t *testing.T) {
 }
 
 func TestRegistryOptions_TLSConfig_rootCAs(t *testing.T) {
-	certFile := "test-fixtures/certs/server.crt"
+	certFile := testutil.GetFixturePath(t, "certs", "server.crt")
+	certsDir := testutil.GetFixturePath(t, "certs")
+	absCertsDir, err := filepath.Abs(certsDir)
+	require.NoError(t, err)
 	systemCerts, err := tlsconfig.SystemCertPool()
 	require.NoError(t, err)
 
@@ -538,7 +544,14 @@ func TestRegistryOptions_TLSConfig_rootCAs(t *testing.T) {
 		{
 			name: "add root certs from dir",
 			registryOptions: RegistryOptions{
-				CAFileOrDir: "test-fixtures/certs",
+				CAFileOrDir: certsDir,
+			},
+			want: certPool,
+		},
+		{
+			name: "add root certs from absolute dir",
+			registryOptions: RegistryOptions{
+				CAFileOrDir: absCertsDir,
 			},
 			want: certPool,
 		},
